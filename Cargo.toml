@@ -8,11 +8,16 @@ name = "media_compress"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-webp = "0.3"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 thiserror = "2"
 anyhow = "1"
 
-[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+# webp is not needed on WASM (that platform returns PlatformNotSupported immediately).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+webp = "0.3"
 
 [dev-dependencies]
+
+# Compile libwebp C sources with optimizations even in debug builds.
+# Without this, libwebp runs at -O0 and is ~20x slower than release.
+[profile.dev.package.libwebp-sys]
+opt-level = 2
