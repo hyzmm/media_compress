@@ -1,0 +1,18 @@
+[package]
+name = "media_compress"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "media_compress"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+webp = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
+thiserror = "2"
+anyhow = "1"
+
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+
+[dev-dependencies]
