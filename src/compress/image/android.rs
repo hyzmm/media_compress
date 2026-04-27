@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
-use crate::error::Error;
 use super::webp_encode;
+use crate::error::Error;
 
 // ---------------------------------------------------------------------------
 // Opaque structs (never constructed in Rust — accessed via pointer only)
@@ -28,6 +28,7 @@ struct AImageDecoderFrameInfo {
 
 const ANDROID_BITMAP_FORMAT_RGBA_8888: i32 = 1;
 const ANDROID_IMAGE_DECODER_SUCCESS: i32 = 0;
+const ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT: i32 = -6;
 const DEFAULT_DELAY_MS: i32 = 100;
 
 // ---------------------------------------------------------------------------
@@ -43,17 +44,13 @@ extern "C" {
 
     fn AImageDecoder_delete(decoder: *mut AImageDecoder);
 
-    fn AImageDecoder_getHeaderInfo(
-        decoder: *const AImageDecoder,
-    ) -> *const AImageDecoderHeaderInfo;
+    fn AImageDecoder_getHeaderInfo(decoder: *const AImageDecoder)
+        -> *const AImageDecoderHeaderInfo;
 
     fn AImageDecoderHeaderInfo_getWidth(info: *const AImageDecoderHeaderInfo) -> i32;
     fn AImageDecoderHeaderInfo_getHeight(info: *const AImageDecoderHeaderInfo) -> i32;
 
-    fn AImageDecoder_setAndroidBitmapFormat(
-        decoder: *mut AImageDecoder,
-        format: i32,
-    ) -> i32;
+    fn AImageDecoder_setAndroidBitmapFormat(decoder: *mut AImageDecoder, format: i32) -> i32;
 
     fn AImageDecoder_getMinimumStride(decoder: *mut AImageDecoder) -> usize;
 
@@ -68,9 +65,7 @@ extern "C" {
 
     fn AImageDecoder_advanceFrame(decoder: *mut AImageDecoder) -> i32;
 
-    fn AImageDecoderFrameInfo_create(
-        decoder: *mut AImageDecoder,
-    ) -> *mut AImageDecoderFrameInfo;
+    fn AImageDecoderFrameInfo_create(decoder: *mut AImageDecoder) -> *mut AImageDecoderFrameInfo;
 
     /// Returns frame duration in nanoseconds.
     fn AImageDecoderFrameInfo_getDuration(info: *const AImageDecoderFrameInfo) -> i64;
@@ -86,12 +81,14 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
     unsafe {
         // ── Create decoder ─────────────────────────────────────────────────
         let mut dec: *mut AImageDecoder = std::ptr::null_mut();
-        let ret = AImageDecoder_createFromBuffer(
-            input.as_ptr() as *const c_void,
-            input.len(),
-            &mut dec,
-        );
+        let ret =
+            AImageDecoder_createFromBuffer(input.as_ptr() as *const c_void, input.len(), &mut dec);
         if ret != ANDROID_IMAGE_DECODER_SUCCESS || dec.is_null() {
+            if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
+                return Err(Error::PlatformNotSupported(
+                    "format not supported by AImageDecoder on this device".into(),
+                ));
+            }
             return Err(Error::DecodeError(format!(
                 "AImageDecoder_createFromBuffer failed: {}",
                 ret
@@ -133,14 +130,15 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
 
         let result = if !animated {
             // ── Static ──────────────────────────────────────────────────────
-            let ret = AImageDecoder_decodeImage(
-                dec,
-                buf.as_mut_ptr() as *mut c_void,
-                stride,
-                buf_size,
-            );
+            let ret =
+                AImageDecoder_decodeImage(dec, buf.as_mut_ptr() as *mut c_void, stride, buf_size);
             if ret != ANDROID_IMAGE_DECODER_SUCCESS {
                 AImageDecoder_delete(dec);
+                if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
+                    return Err(Error::PlatformNotSupported(
+                        "format not supported by AImageDecoder on this device".into(),
+                    ));
+                }
                 return Err(Error::DecodeError(format!(
                     "AImageDecoder_decodeImage failed: {}",
                     ret
@@ -166,6 +164,11 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
                 if ret != ANDROID_IMAGE_DECODER_SUCCESS {
                     if is_first {
                         AImageDecoder_delete(dec);
+                        if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
+                            return Err(Error::PlatformNotSupported(
+                                "format not supported by AImageDecoder on this device".into(),
+                            ));
+                        }
                         return Err(Error::DecodeError(format!(
                             "AImageDecoder_decodeImage failed on frame 0: {}",
                             ret

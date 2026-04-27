@@ -7,7 +7,7 @@ fn main() {
             println!("cargo:rustc-link-lib=framework=CoreGraphics");
         }
         "android" => {
-            println!("cargo:rustc-link-lib=jnigraphics");
+            println!("cargo:rustc-link-lib=jnigraphics"); // AImageDecoder (API 30+)
         }
         "windows" => {
             println!("cargo:rustc-link-lib=windowscodecs");
