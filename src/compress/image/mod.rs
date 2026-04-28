@@ -15,7 +15,7 @@ mod android;
 mod windows;
 
 #[cfg(target_arch = "wasm32")]
-mod wasm;
+pub mod wasm;
 
 // ---------------------------------------------------------------------------
 // Supported input image formats (used for format detection and error messages)
@@ -53,8 +53,7 @@ impl ImageFormat {
                 let brand = &d[8..12];
                 if matches!(
                     brand,
-                    b"heic" | b"heix" | b"heim" | b"heis" | b"hevm" | b"hevs"
-                        | b"mif1" | b"msf1"
+                    b"heic" | b"heix" | b"heim" | b"heis" | b"hevm" | b"hevs" | b"mif1" | b"msf1"
                 ) {
                     Some(Self::Heic)
                 } else {
