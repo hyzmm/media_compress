@@ -1,3 +1,4 @@
+use crate::compress::image::ImageFormat;
 use crate::error::Error;
 use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
@@ -55,10 +56,18 @@ extern "C" {
 /// ```
 #[wasm_bindgen]
 pub async fn compress_image_js(input: &[u8], quality: f32) -> Result<Uint8Array, JsValue> {
+    let may_fallback =
+        ImageFormat::detect(input).map_or(false, |fmt| fmt.should_use_original_if_larger());
+
     let js_bytes = Uint8Array::from(input);
     let promise = _mc_to_webp(&js_bytes, quality)?;
     let result = JsFuture::from(promise).await?;
-    Ok(Uint8Array::new(&result))
+    let compressed = Uint8Array::new(&result);
+
+    if may_fallback && compressed.length() as usize > input.len() {
+        return Ok(js_bytes);
+    }
+    Ok(compressed)
 }
 
 /// Synchronous path — always returns `PlatformNotSupported`.

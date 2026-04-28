@@ -25,3 +25,13 @@ test_android:
     #   Create an AVD in Android Studio (API 31+, arm64-v8a) and start it,
     #   or connect a physical device with USB debugging enabled.
     cargo dinghy --platform auto-android-aarch64-api31 test --test compress_images -- compress_all_test_images --nocapture
+
+test_desktop:
+    cargo test --test compress_images -- compress_all_test_images --nocapture
+
+test_all:
+    just test_web_chrome
+    just test_web_safari
+    just test_ios
+    just test_android
+    just test_desktop

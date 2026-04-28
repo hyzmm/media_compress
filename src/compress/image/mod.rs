@@ -63,6 +63,13 @@ impl ImageFormat {
             _ => None,
         }
     }
+
+    /// Returns `true` if the format is one that may already be well-compressed
+    /// (WebP, JPEG, or PNG), meaning we should keep the original when the
+    /// compressed output turns out to be larger.
+    pub fn should_use_original_if_larger(&self) -> bool {
+        matches!(self, Self::Webp | Self::Jpeg | Self::Png)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -90,30 +97,34 @@ pub fn compress_image(
 ) -> Result<Vec<u8>, Error> {
     // Validate or detect format (used only for error messages if the platform
     // rejects the input; the native API handles actual format detection).
-    let _fmt = match format {
+    let fmt = match format {
         Some(f) => f,
         None => ImageFormat::detect(input).ok_or_else(|| {
             Error::UnsupportedFormat("Cannot detect image format from magic bytes".into())
         })?,
     };
 
+    // Whether the source format is one of the common lossy/lossless formats
+    // that may already be well-compressed. If the output ends up larger than
+    // the input we fall back to the original bytes.
+    let may_fallback = fmt.should_use_original_if_larger();
+
     // Route to the platform implementation. Each platform's `compress()`
     // function receives the raw bytes and lets the OS API detect the format.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    return apple::compress(input, quality);
+    let compressed = apple::compress(input, quality)?;
 
     #[cfg(target_os = "android")]
-    return android::compress(input, quality);
+    let compressed = android::compress(input, quality)?;
 
     #[cfg(target_os = "windows")]
-    return windows::compress(input, quality);
+    let compressed = windows::compress(input, quality)?;
 
     #[cfg(target_arch = "wasm32")]
-    return wasm::compress(input, quality);
+    let compressed = wasm::compress(input, quality)?;
 
-    // Fallback for unsupported platforms (e.g. Linux desktop)
-    #[allow(unreachable_code)]
-    Err(Error::PlatformNotSupported(
-        "Image compression is not supported on this platform".into(),
-    ))
+    if may_fallback && compressed.len() > input.len() {
+        return Ok(input.to_vec());
+    }
+    return Ok(compressed);
 }
