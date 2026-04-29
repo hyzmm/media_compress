@@ -18,13 +18,16 @@ test_ios:
     open -a Simulator
     cargo dinghy --platform auto-ios-aarch64-sim --device sim test --test compress_images -- compress_all_test_images --nocapture
 
-test_android:
+test_android_24:
     # Prerequisites (one-time setup):
     #   rustup target add aarch64-linux-android
     #   cargo install cargo-dinghy
     #   Create an AVD in Android Studio (API 24+, arm64-v8a) and start it,
     #   or connect a physical device with USB debugging enabled.
     cargo dinghy --platform auto-android-aarch64-api24 test --test compress_images -- compress_all_test_images --nocapture
+
+test_android_31:
+    cargo dinghy --platform auto-android-aarch64-api31 test --test compress_images -- compress_all_test_images --nocapture
 
 test_desktop:
     cargo test --test compress_images -- compress_all_test_images --nocapture

@@ -1,3 +1,4 @@
+use crate::compress::image::webp_encode;
 use jni::objects::{JByteArray, JObject, JValue};
 use jni::sys::{jint, jobject, JNIEnv as JNIEnvRaw};
 use jni::JNIEnv;
@@ -32,21 +33,9 @@ extern "C" {
     ) -> i32;
     fn AndroidBitmap_unlockPixels(env: *mut JNIEnvRaw, bitmap: jobject) -> i32;
 }
-/// 通过 JNI 获取 android.os.Build.VERSION.SDK_INT
-pub fn get_sdk_int(env: &jni::JNIEnv) -> Result<i32, crate::error::Error> {
-    let version_class = env
-        .find_class("android/os/Build$VERSION")
-        .map_err(|e| crate::error::Error::NativeError(format!("find Build.VERSION failed: {e}")))?;
-    let sdk_int_field = env
-        .get_static_field(version_class, "SDK_INT", "I")
-        .map_err(|e| crate::error::Error::NativeError(format!("get SDK_INT failed: {e}")))?;
-    sdk_int_field
-        .i()
-        .map_err(|e| crate::error::Error::NativeError(format!("SDK_INT not int: {e}")))
-}
 
 pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
-    let (rgba, w, h) = jni_bitmap_factory::decode_to_rgba(input)?;
+    let (rgba, w, h) = decode_to_rgba(input)?;
     webp_encode::encode_static(&rgba, w, h, quality)
 }
 

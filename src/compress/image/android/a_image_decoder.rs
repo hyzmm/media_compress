@@ -1,6 +1,7 @@
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
+use std::sync::OnceLock;
 
-use super::webp_encode;
+use crate::compress::image::webp_encode;
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -32,45 +33,115 @@ const ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT: i32 = -6;
 const DEFAULT_DELAY_MS: i32 = 100;
 
 // ---------------------------------------------------------------------------
-// FFI — android/imagedecoder.h  (NDK API level 28+)
+// Dynamic loading — avoids static symbol references so the binary can load
+// on API < 28 devices. Symbols are resolved at call time via dlsym.
+//
+// On API 28-33, AImageDecoder symbols are in libmediandk.so.
+// On API 34+, they're in libandroid.so (always loaded → RTLD_DEFAULT works).
+// We try RTLD_DEFAULT first, then fall back to dlopen("libmediandk.so").
 // ---------------------------------------------------------------------------
 
+const RTLD_DEFAULT: *mut c_void = 0 as *mut c_void;
+const RTLD_NOW: i32 = 2;
+
 extern "C" {
-    fn AImageDecoder_createFromBuffer(
-        buffer: *const c_void,
-        length: usize,
-        out_decoder: *mut *mut AImageDecoder,
-    ) -> i32;
+    fn dlopen(filename: *const c_char, flag: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
 
-    fn AImageDecoder_delete(decoder: *mut AImageDecoder);
+// ---------------------------------------------------------------------------
+// Function pointer types
+// ---------------------------------------------------------------------------
 
-    fn AImageDecoder_getHeaderInfo(decoder: *const AImageDecoder)
-        -> *const AImageDecoderHeaderInfo;
+type CreateFromBufferFn =
+    unsafe extern "C" fn(*const c_void, usize, *mut *mut AImageDecoder) -> i32;
+type DeleteFn = unsafe extern "C" fn(*mut AImageDecoder);
+type GetHeaderInfoFn =
+    unsafe extern "C" fn(*const AImageDecoder) -> *const AImageDecoderHeaderInfo;
+type HeaderGetWidthFn = unsafe extern "C" fn(*const AImageDecoderHeaderInfo) -> i32;
+type HeaderGetHeightFn = unsafe extern "C" fn(*const AImageDecoderHeaderInfo) -> i32;
+type SetBitmapFormatFn = unsafe extern "C" fn(*mut AImageDecoder, i32) -> i32;
+type GetMinimumStrideFn = unsafe extern "C" fn(*mut AImageDecoder) -> usize;
+type DecodeImageFn =
+    unsafe extern "C" fn(*mut AImageDecoder, *mut c_void, usize, usize) -> i32;
+type IsAnimatedFn = unsafe extern "C" fn(*mut AImageDecoder) -> i32;
+type AdvanceFrameFn = unsafe extern "C" fn(*mut AImageDecoder) -> i32;
+type FrameInfoCreateFn =
+    unsafe extern "C" fn(*mut AImageDecoder) -> *mut AImageDecoderFrameInfo;
+type FrameInfoGetDurationFn = unsafe extern "C" fn(*const AImageDecoderFrameInfo) -> i64;
+type FrameInfoDeleteFn = unsafe extern "C" fn(*mut AImageDecoderFrameInfo);
 
-    fn AImageDecoderHeaderInfo_getWidth(info: *const AImageDecoderHeaderInfo) -> i32;
-    fn AImageDecoderHeaderInfo_getHeight(info: *const AImageDecoderHeaderInfo) -> i32;
+#[allow(non_snake_case)]
+struct Api {
+    AImageDecoder_createFromBuffer: CreateFromBufferFn,
+    AImageDecoder_delete: DeleteFn,
+    AImageDecoder_getHeaderInfo: GetHeaderInfoFn,
+    AImageDecoderHeaderInfo_getWidth: HeaderGetWidthFn,
+    AImageDecoderHeaderInfo_getHeight: HeaderGetHeightFn,
+    AImageDecoder_setAndroidBitmapFormat: SetBitmapFormatFn,
+    AImageDecoder_getMinimumStride: GetMinimumStrideFn,
+    AImageDecoder_decodeImage: DecodeImageFn,
+    AImageDecoder_isAnimated: IsAnimatedFn,
+    AImageDecoder_advanceFrame: AdvanceFrameFn,
+    AImageDecoderFrameInfo_create: FrameInfoCreateFn,
+    AImageDecoderFrameInfo_getDuration: FrameInfoGetDurationFn,
+    AImageDecoderFrameInfo_delete: FrameInfoDeleteFn,
+}
 
-    fn AImageDecoder_setAndroidBitmapFormat(decoder: *mut AImageDecoder, format: i32) -> i32;
+unsafe impl Send for Api {}
+unsafe impl Sync for Api {}
 
-    fn AImageDecoder_getMinimumStride(decoder: *mut AImageDecoder) -> usize;
+fn api() -> Option<&'static Api> {
+    static API: OnceLock<Option<Api>> = OnceLock::new();
+    API.get_or_init(try_load).as_ref()
+}
 
-    fn AImageDecoder_decodeImage(
-        decoder: *mut AImageDecoder,
-        pixels: *mut c_void,
-        stride: usize,
-        size: usize,
-    ) -> i32;
+fn try_load() -> Option<Api> {
+    unsafe {
+        // Try RTLD_DEFAULT first (covers libandroid.so on API 34+).
+        let handle = try_load_from(RTLD_DEFAULT);
+        if handle.is_some() {
+            return handle;
+        }
+        // Fall back to dlopen("libmediandk.so") for API 28-33.
+        let mediandk = dlopen(c"libmediandk.so".as_ptr(), RTLD_NOW);
+        if mediandk.is_null() {
+            return None;
+        }
+        try_load_from(mediandk)
+    }
+}
 
-    fn AImageDecoder_isAnimated(decoder: *mut AImageDecoder) -> i32;
+fn try_load_from(handle: *mut c_void) -> Option<Api> {
+    unsafe {
+        macro_rules! load {
+            ($name:expr) => {{
+                let ptr = dlsym(handle, concat!($name, "\0").as_ptr() as *const c_char);
+                if ptr.is_null() {
+                    return None;
+                }
+                std::mem::transmute::<*mut c_void, _>(ptr)
+            }};
+        }
 
-    fn AImageDecoder_advanceFrame(decoder: *mut AImageDecoder) -> i32;
-
-    fn AImageDecoderFrameInfo_create(decoder: *mut AImageDecoder) -> *mut AImageDecoderFrameInfo;
-
-    /// Returns frame duration in nanoseconds.
-    fn AImageDecoderFrameInfo_getDuration(info: *const AImageDecoderFrameInfo) -> i64;
-
-    fn AImageDecoderFrameInfo_delete(info: *mut AImageDecoderFrameInfo);
+        Some(Api {
+            AImageDecoder_createFromBuffer: load!("AImageDecoder_createFromBuffer"),
+            AImageDecoder_delete: load!("AImageDecoder_delete"),
+            AImageDecoder_getHeaderInfo: load!("AImageDecoder_getHeaderInfo"),
+            AImageDecoderHeaderInfo_getWidth: load!("AImageDecoderHeaderInfo_getWidth"),
+            AImageDecoderHeaderInfo_getHeight: load!("AImageDecoderHeaderInfo_getHeight"),
+            AImageDecoder_setAndroidBitmapFormat: load!(
+                "AImageDecoder_setAndroidBitmapFormat"
+            ),
+            AImageDecoder_getMinimumStride: load!("AImageDecoder_getMinimumStride"),
+            AImageDecoder_decodeImage: load!("AImageDecoder_decodeImage"),
+            AImageDecoder_isAnimated: load!("AImageDecoder_isAnimated"),
+            AImageDecoder_advanceFrame: load!("AImageDecoder_advanceFrame"),
+            AImageDecoderFrameInfo_create: load!("AImageDecoderFrameInfo_create"),
+            AImageDecoderFrameInfo_getDuration: load!("AImageDecoderFrameInfo_getDuration"),
+            AImageDecoderFrameInfo_delete: load!("AImageDecoderFrameInfo_delete"),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,11 +149,23 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
+    let api = match api() {
+        Some(a) => a,
+        None => {
+            return Err(Error::PlatformNotSupported(
+                "AImageDecoder not available on this device (requires API 28+)".into(),
+            ));
+        }
+    };
+
     unsafe {
         // ── Create decoder ─────────────────────────────────────────────────
         let mut dec: *mut AImageDecoder = std::ptr::null_mut();
-        let ret =
-            AImageDecoder_createFromBuffer(input.as_ptr() as *const c_void, input.len(), &mut dec);
+        let ret = (api.AImageDecoder_createFromBuffer)(
+            input.as_ptr() as *const c_void,
+            input.len(),
+            &mut dec,
+        );
         if ret != ANDROID_IMAGE_DECODER_SUCCESS || dec.is_null() {
             if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
                 return Err(Error::PlatformNotSupported(
@@ -96,44 +179,49 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
         }
 
         // ── Get dimensions ─────────────────────────────────────────────────
-        let info = AImageDecoder_getHeaderInfo(dec);
+        let info = (api.AImageDecoder_getHeaderInfo)(dec);
         if info.is_null() {
-            AImageDecoder_delete(dec);
+            (api.AImageDecoder_delete)(dec);
             return Err(Error::DecodeError(
                 "AImageDecoder_getHeaderInfo returned null".into(),
             ));
         }
-        let w = AImageDecoderHeaderInfo_getWidth(info) as u32;
-        let h = AImageDecoderHeaderInfo_getHeight(info) as u32;
+        let w = (api.AImageDecoderHeaderInfo_getWidth)(info) as u32;
+        let h = (api.AImageDecoderHeaderInfo_getHeight)(info) as u32;
 
         if w == 0 || h == 0 {
-            AImageDecoder_delete(dec);
+            (api.AImageDecoder_delete)(dec);
             return Err(Error::DecodeError("Image has zero dimensions".into()));
         }
 
         // ── Force RGBA_8888 output ─────────────────────────────────────────
-        let ret = AImageDecoder_setAndroidBitmapFormat(dec, ANDROID_BITMAP_FORMAT_RGBA_8888);
+        let ret =
+            (api.AImageDecoder_setAndroidBitmapFormat)(dec, ANDROID_BITMAP_FORMAT_RGBA_8888);
         if ret != ANDROID_IMAGE_DECODER_SUCCESS {
-            AImageDecoder_delete(dec);
+            (api.AImageDecoder_delete)(dec);
             return Err(Error::DecodeError(format!(
                 "AImageDecoder_setAndroidBitmapFormat failed: {}",
                 ret
             )));
         }
 
-        let stride = AImageDecoder_getMinimumStride(dec);
+        let stride = (api.AImageDecoder_getMinimumStride)(dec);
         let buf_size = stride * h as usize;
         let mut buf = vec![0u8; buf_size];
 
         // ── Animated or static? ────────────────────────────────────────────
-        let animated = AImageDecoder_isAnimated(dec) != 0;
+        let animated = (api.AImageDecoder_isAnimated)(dec) != 0;
 
         let result = if !animated {
             // ── Static ──────────────────────────────────────────────────────
-            let ret =
-                AImageDecoder_decodeImage(dec, buf.as_mut_ptr() as *mut c_void, stride, buf_size);
+            let ret = (api.AImageDecoder_decodeImage)(
+                dec,
+                buf.as_mut_ptr() as *mut c_void,
+                stride,
+                buf_size,
+            );
             if ret != ANDROID_IMAGE_DECODER_SUCCESS {
-                AImageDecoder_delete(dec);
+                (api.AImageDecoder_delete)(dec);
                 if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
                     return Err(Error::PlatformNotSupported(
                         "format not supported by AImageDecoder on this device".into(),
@@ -149,13 +237,11 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
             webp_encode::encode_static(&rgba, w, h, quality)
         } else {
             // ── Animated ────────────────────────────────────────────────────
-            // Collect all frame pixel data first so that every Vec<u8> lives
-            // long enough for AnimEncoder (which borrows each slice).
             let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::new();
             let mut is_first = true;
 
             loop {
-                let ret = AImageDecoder_decodeImage(
+                let ret = (api.AImageDecoder_decodeImage)(
                     dec,
                     buf.as_mut_ptr() as *mut c_void,
                     stride,
@@ -163,7 +249,7 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
                 );
                 if ret != ANDROID_IMAGE_DECODER_SUCCESS {
                     if is_first {
-                        AImageDecoder_delete(dec);
+                        (api.AImageDecoder_delete)(dec);
                         if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
                             return Err(Error::PlatformNotSupported(
                                 "format not supported by AImageDecoder on this device".into(),
@@ -181,18 +267,18 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
                 let rgba = compact_rgba(&buf, w, h, stride);
 
                 // Read frame duration before advancing
-                let fi = AImageDecoderFrameInfo_create(dec);
+                let fi = (api.AImageDecoderFrameInfo_create)(dec);
                 let delay_ms = if fi.is_null() {
                     DEFAULT_DELAY_MS
                 } else {
-                    let ns = AImageDecoderFrameInfo_getDuration(fi);
-                    AImageDecoderFrameInfo_delete(fi);
+                    let ns = (api.AImageDecoderFrameInfo_getDuration)(fi);
+                    (api.AImageDecoderFrameInfo_delete)(fi);
                     ((ns / 1_000_000) as i32).max(10)
                 };
 
                 frame_data.push((rgba, delay_ms));
 
-                let adv = AImageDecoder_advanceFrame(dec);
+                let adv = (api.AImageDecoder_advanceFrame)(dec);
                 if adv != ANDROID_IMAGE_DECODER_SUCCESS {
                     break;
                 }
@@ -201,7 +287,7 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
             webp_encode::encode_animated(&frame_data, w, h, quality)
         };
 
-        AImageDecoder_delete(dec);
+        (api.AImageDecoder_delete)(dec);
         result
     }
 }
