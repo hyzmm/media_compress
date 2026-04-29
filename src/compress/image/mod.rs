@@ -87,7 +87,7 @@ impl ImageFormat {
 /// | Platform | Formats                                   |
 /// |----------|-------------------------------------------|
 /// | macOS / iOS | JPEG, PNG, GIF, BMP, HEIC, TIFF, WebP |
-/// | Android (API 28+) | JPEG, PNG, GIF, BMP, WebP       |
+/// | Android (API 24+) | JPEG, PNG, GIF, BMP, WebP, TIFF |
 /// | Windows  | JPEG, PNG, GIF, BMP, TIFF, WebP           |
 /// | Web/WASM | not supported (decode on the JS side)     |
 pub fn compress_image(

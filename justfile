@@ -22,9 +22,9 @@ test_android:
     # Prerequisites (one-time setup):
     #   rustup target add aarch64-linux-android
     #   cargo install cargo-dinghy
-    #   Create an AVD in Android Studio (API 31+, arm64-v8a) and start it,
+    #   Create an AVD in Android Studio (API 24+, arm64-v8a) and start it,
     #   or connect a physical device with USB debugging enabled.
-    cargo dinghy --platform auto-android-aarch64-api31 test --test compress_images -- compress_all_test_images --nocapture
+    cargo dinghy --platform auto-android-aarch64-api24 test --test compress_images -- compress_all_test_images --nocapture
 
 test_desktop:
     cargo test --test compress_images -- compress_all_test_images --nocapture
@@ -35,3 +35,6 @@ test_all:
     just test_ios
     just test_android
     just test_desktop
+
+build_android:
+    cargo dinghy --platform auto-android-aarch64-api24 build --release
