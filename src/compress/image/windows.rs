@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
-use crate::error::Error;
 use super::webp_encode;
+use crate::error::Error;
 
 // ---------------------------------------------------------------------------
 // Windows-only types
@@ -13,6 +13,11 @@ type BOOL = i32;
 const S_OK: HRESULT = 0;
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
 const CLSCTX_INPROC_SERVER: u32 = 0x1;
+
+/// MF_E_TOPO_CODEC_NOT_FOUND: no suitable transform found to decode the content.
+const MF_E_TOPO_CODEC_NOT_FOUND: HRESULT = 0xC00D5212u32 as i32;
+/// WINCODEC_ERR_COMPONENTNOTFOUND: no WIC codec registered for this format.
+const WINCODEC_ERR_COMPONENTNOTFOUND: HRESULT = 0x88982F50u32 as i32;
 
 /// WICDecodeOptions: WICDecodeMetadataCacheOnLoad = 0
 const WIC_DECODE_METADATA_CACHE_ON_LOAD: u32 = 0;
@@ -58,6 +63,14 @@ const GUID_WIC_PIXEL_FORMAT_32BPP_RGBA: GUID = GUID {
     data2: 0x6a8d,
     data3: 0x43dd,
     data4: [0xa7, 0xa8, 0xa2, 0x99, 0x35, 0x26, 0x1a, 0xe9],
+};
+
+/// GUID_WICPixelFormat32bppBGRA {6FDDC324-4E03-4BFE-B185-3D77768DC90F}
+const GUID_WIC_PIXEL_FORMAT_32BPP_BGRA: GUID = GUID {
+    data1: 0x6fddc324,
+    data2: 0x4e03,
+    data3: 0x4bfe,
+    data4: [0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0f],
 };
 
 // ---------------------------------------------------------------------------
@@ -112,7 +125,7 @@ impl IUnknown {
     /// Safety: caller must ensure correct slot, argument types and ABI.
     #[inline(always)]
     unsafe fn call_slot<R>(&self, slot: usize) -> *const c_void {
-        *(*self.vtable).add(slot)
+        *self.vtable.add(slot)
     }
 }
 
@@ -166,12 +179,17 @@ extern "system" {
 // ---------------------------------------------------------------------------
 
 // IWICImagingFactory (inherits IUnknown):
-const WIC_FACTORY_CREATE_DECODER_FROM_STREAM: usize = 14;
-const WIC_FACTORY_CREATE_FORMAT_CONVERTER: usize = 17;
+// 3=CreateDecoderFromFilename, 4=CreateDecoderFromStream, 5=CreateDecoderFromFileHandle,
+// 6=CreateComponentInfo, 7=CreateDecoder, 8=CreateEncoder, 9=CreatePalette, 10=CreateFormatConverter
+const WIC_FACTORY_CREATE_DECODER_FROM_STREAM: usize = 4;
+const WIC_FACTORY_CREATE_FORMAT_CONVERTER: usize = 10;
 
 // IWICBitmapDecoder (inherits IUnknown):
-const WIC_DECODER_GET_FRAME_COUNT: usize = 7;
-const WIC_DECODER_GET_FRAME: usize = 8;
+// 3=QueryCapability, 4=Initialize, 5=GetContainerFormat, 6=GetDecoderInfo,
+// 7=CopyPalette, 8=GetMetadataQueryReader, 9=GetPreview, 10=GetColorContexts,
+// 11=GetThumbnail, 12=GetFrameCount, 13=GetFrame
+const WIC_DECODER_GET_FRAME_COUNT: usize = 12;
+const WIC_DECODER_GET_FRAME: usize = 13;
 
 // IWICBitmapFrameDecode (inherits IWICBitmapSource, IUnknown):
 // IWICBitmapSource slots: 3=GetSize, 4=GetPixelFormat, 5=GetResolution, 6=CopyPalette, 7=CopyPixels
@@ -288,13 +306,22 @@ unsafe fn decode_wic_frame(
         )));
     }
 
-    // Initialize converter: source → 32bppRGBA, no dithering, no palette
+    // Initialize converter: source → 32bppBGRA first (universally supported),
+    // then swap R↔B to produce RGBA for the WebP encoder.
     let hr: HRESULT = com_call!(
         converter,
         WIC_FORMAT_CONVERTER_INITIALIZE,
-        unsafe extern "system" fn(*mut c_void, *mut c_void, *const GUID, u32, *mut c_void, f64, u32) -> HRESULT,
+        unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            *const GUID,
+            u32,
+            *mut c_void,
+            f64,
+            u32,
+        ) -> HRESULT,
         frame,
-        &GUID_WIC_PIXEL_FORMAT_32BPP_RGBA as *const GUID,
+        &GUID_WIC_PIXEL_FORMAT_32BPP_BGRA as *const GUID,
         WIC_BITMAP_DITHER_TYPE_NONE,
         std::ptr::null_mut::<c_void>(),
         0.0f64,
@@ -326,10 +353,20 @@ unsafe fn decode_wic_frame(
     com_call!(converter, 2, unsafe extern "system" fn(*mut c_void) -> u32); // Release converter
 
     if hr != S_OK {
+        if hr == MF_E_TOPO_CODEC_NOT_FOUND {
+            return Err(Error::PlatformNotSupported(
+                "codec not installed (MF_E_TOPO_CODEC_NOT_FOUND)".into(),
+            ));
+        }
         return Err(Error::DecodeError(format!(
             "IWICFormatConverter::CopyPixels failed: 0x{:08x}",
             hr
         )));
+    }
+
+    // BGRA → RGBA: swap B (byte 0) and R (byte 2) in each 4-byte pixel.
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk.swap(0, 2);
     }
 
     Ok((pixels, w, h))
@@ -353,9 +390,7 @@ unsafe fn get_gif_delay_ms(frame: *mut c_void) -> i32 {
     let mut pv = PROPVARIANT::zero();
 
     // Path: "/grctlext/Delay" as a null-terminated wide string
-    let path_wide: Vec<u16> = "/grctlext/Delay\0"
-        .encode_utf16()
-        .collect();
+    let path_wide: Vec<u16> = "/grctlext/Delay\0".encode_utf16().collect();
 
     let hr: HRESULT = com_call!(
         mqr,
@@ -415,7 +450,13 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
         let hr: HRESULT = com_call!(
             factory,
             WIC_FACTORY_CREATE_DECODER_FROM_STREAM,
-            unsafe extern "system" fn(*mut c_void, *mut c_void, *const GUID, u32, *mut *mut c_void) -> HRESULT,
+            unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                *const GUID,
+                u32,
+                *mut *mut c_void,
+            ) -> HRESULT,
             stream,
             std::ptr::null::<GUID>(), // no preferred vendor
             WIC_DECODE_METADATA_CACHE_ON_LOAD,
@@ -425,6 +466,12 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
 
         if hr != S_OK || decoder.is_null() {
             com_call!(factory, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            if hr == WINCODEC_ERR_COMPONENTNOTFOUND || hr == MF_E_TOPO_CODEC_NOT_FOUND {
+                return Err(Error::PlatformNotSupported(format!(
+                    "no WIC decoder registered for this format (0x{:08x})",
+                    hr as u32
+                )));
+            }
             return Err(Error::DecodeError(format!(
                 "IWICImagingFactory::CreateDecoderFromStream failed: 0x{:08x}",
                 hr
