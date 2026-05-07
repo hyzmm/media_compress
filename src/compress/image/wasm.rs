@@ -2,39 +2,51 @@ use crate::compress::image::ImageFormat;
 use crate::error::Error;
 use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::{Blob, ImageEncodeOptions, ImageBitmapRenderingContext, OffscreenCanvas};
 
-// ---------------------------------------------------------------------------
-// Inline JS helper
-//
-// Uses the browser's `createImageBitmap` + `OffscreenCanvas.convertToBlob`
-// to decode any browser-supported image format and re-encode it as WebP.
-// Both APIs are asynchronous, so the function returns a Promise.
-// ---------------------------------------------------------------------------
-#[wasm_bindgen(inline_js = "
-export function _mc_to_webp(bytes, quality) {
-    var blob = new Blob([bytes]);
-    return createImageBitmap(blob)
-        .then(function(bitmap) {
-            var canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-            var ctx = canvas.getContext('2d');
-            ctx.drawImage(bitmap, 0, 0);
-            return canvas.convertToBlob({ type: 'image/webp', quality: quality / 100.0 })
-                .then(function(b) {
-                    if (b.type === 'image/webp') {
-                        return b;
-                    }
-                    // Browser does not support WebP encoding (e.g. Safari) — fall back to JPEG.
-                    return canvas.convertToBlob({ type: 'image/jpeg', quality: quality / 100.0 });
-                });
-        })
-        .then(function(b) { return b.arrayBuffer(); })
-        .then(function(buf) { return new Uint8Array(buf); });
-}
-")]
-extern "C" {
-    #[wasm_bindgen(catch)]
-    fn _mc_to_webp(bytes: &Uint8Array, quality: f32) -> Result<js_sys::Promise, JsValue>;
+/// Decode raw image bytes with `createImageBitmap`, draw onto `OffscreenCanvas`,
+/// and re-encode to WebP (or JPEG if the browser lacks WebP encoder support).
+async fn canvas_compress(input: &[u8], quality: f32) -> Result<Uint8Array, JsValue> {
+    let bytes = Uint8Array::from(input);
+    let array = js_sys::Array::of1(&bytes);
+
+    let blob = Blob::new_with_u8_array_sequence(&array)?;
+    let bitmap = {
+        let window = web_sys::window().expect("no window");
+        let promise = window.create_image_bitmap_with_blob(&blob)?;
+        JsFuture::from(promise).await?.dyn_into::<web_sys::ImageBitmap>()?
+    };
+
+    let canvas = OffscreenCanvas::new(bitmap.width(), bitmap.height())?;
+    let ctx = canvas
+        .get_context("bitmaprenderer")?
+        .expect("bitmaprenderer context not available")
+        .dyn_into::<ImageBitmapRenderingContext>()?;
+    ctx.transfer_from_image_bitmap(&bitmap);
+
+    // Encode to WebP
+    let mut opts = ImageEncodeOptions::new();
+    opts.type_("image/webp");
+    opts.quality((quality as f64) / 100.0);
+
+    let result = JsFuture::from(canvas.convert_to_blob_with_options(&opts)?).await?;
+    let blob = result.dyn_into::<Blob>()?;
+
+    // Fall back to JPEG if the browser doesn't support WebP encoding (e.g. Safari)
+    let blob = if blob.type_() == "image/webp" {
+        blob
+    } else {
+        let mut jpeg_opts = ImageEncodeOptions::new();
+        jpeg_opts.type_("image/jpeg");
+        jpeg_opts.quality((quality as f64) / 100.0);
+        let jpeg_result = JsFuture::from(canvas.convert_to_blob_with_options(&jpeg_opts)?).await?;
+        jpeg_result.dyn_into::<Blob>()?
+    };
+
+    let array_buf = JsFuture::from(blob.array_buffer()).await?;
+    Ok(Uint8Array::new(&array_buf))
 }
 
 /// Compress raw image bytes to lossy WebP using the browser's Canvas API.
@@ -60,9 +72,7 @@ pub async fn compress_image_js(input: &[u8], quality: f32) -> Result<Uint8Array,
         ImageFormat::detect(input).map_or(false, |fmt| fmt.should_use_original_if_larger());
 
     let js_bytes = Uint8Array::from(input);
-    let promise = _mc_to_webp(&js_bytes, quality)?;
-    let result = JsFuture::from(promise).await?;
-    let compressed = Uint8Array::new(&result);
+    let compressed = canvas_compress(input, quality).await?;
 
     if may_fallback && compressed.length() as usize > input.len() {
         return Ok(js_bytes);
