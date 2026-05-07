@@ -80,7 +80,6 @@ impl ImageFormat {
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image (any supported format)
-/// * `format`  — optional format hint; if `None`, auto-detection is attempted
 /// * `quality` — WebP lossy quality, 0–100 (e.g. 80 is a good default)
 ///
 /// # Platform support
@@ -90,19 +89,12 @@ impl ImageFormat {
 /// | Android (API 24+) | JPEG, PNG, GIF, BMP, WebP, TIFF |
 /// | Windows  | JPEG, PNG, GIF, BMP, TIFF, WebP           |
 /// | Web/WASM | not supported (decode on the JS side)     |
-pub fn compress_image(
-    input: &[u8],
-    format: Option<ImageFormat>,
-    quality: f32,
-) -> Result<Vec<u8>, Error> {
+pub fn compress_image(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
     // Validate or detect format (used only for error messages if the platform
     // rejects the input; the native API handles actual format detection).
-    let fmt = match format {
-        Some(f) => f,
-        None => ImageFormat::detect(input).ok_or_else(|| {
-            Error::UnsupportedFormat("Cannot detect image format from magic bytes".into())
-        })?,
-    };
+    let fmt = ImageFormat::detect(input).ok_or_else(|| {
+        Error::UnsupportedFormat("Cannot detect image format from magic bytes".into())
+    })?;
 
     // Whether the source format is one of the common lossy/lossless formats
     // that may already be well-compressed. If the output ends up larger than
