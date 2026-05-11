@@ -41,16 +41,11 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
 
 fn decode_to_rgba(input: &[u8]) -> Result<(Vec<u8>, u32, u32), Error> {
     let fmt = ImageFormat::detect(input);
-    let ctx = match try_android_context() {
-        Some(c) => c,
-        None => {
-            return unsupported_for_format(
-                fmt,
-                "android context was not initialized (non-Activity runtime)",
-            )
-        }
-    };
-    let vm_ptr = ctx.vm();
+    let vm_ptr = try_java_vm_ptr().ok_or_else(|| {
+        Error::PlatformNotSupported(
+            "Android JNI fallback decoder unavailable: JavaVM was not initialized. Ensure JNI_OnLoad wires JavaVM via media_compress::init_android_java_vm()".to_string(),
+        )
+    })?;
     if vm_ptr.is_null() {
         return unsupported_for_format(fmt, "Java VM is unavailable in this runtime");
     }
@@ -62,6 +57,11 @@ fn decode_to_rgba(input: &[u8]) -> Result<(Vec<u8>, u32, u32), Error> {
         .map_err(|e| Error::NativeError(format!("attach_current_thread failed: {e}")))?;
 
     decode_with_bitmap_factory(&mut env, input, fmt)
+}
+
+fn try_java_vm_ptr() -> Option<*mut jni::sys::JavaVM> {
+    crate::android_runtime::java_vm_ptr()
+        .or_else(|| try_android_context().map(|ctx| ctx.vm() as *mut jni::sys::JavaVM))
 }
 
 fn try_android_context() -> Option<ndk_context::AndroidContext> {
