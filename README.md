@@ -6,8 +6,8 @@
 
 ### 1. 总体架构
 
-- 入口 API：`compress_image(input, quality)`
-- Web 专用异步 API：`compress_image_js(input, quality)`
+- 入口 API：`compress_image(input, options)`
+- Web 专用异步 API：`compress_image_js(input, quality, min_width?, min_height?)`
 - 编码目标：
     - Native 平台：统一编码为 WebP
     - Web/WASM：优先 WebP，浏览器不支持时回退 JPEG
@@ -37,6 +37,7 @@
 ### 3. 压缩策略
 
 - 质量参数：`quality` 取值 0-100（常用 75）
+- 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
 - Native 编码配置：有损 WebP + 多线程
 - 动图处理：保留帧序与延迟，输出 Animated WebP
 
@@ -89,15 +90,15 @@
 
 按格式分组的 quality 对比（压缩后占原图比例，越低越好）：
 
-| 格式 | q50 | q75 | q90 |
-| --- | --: | --: | --: |
-| BMP | 1.2% | 1.7% | 3.8% |
-| GIF | 8.6% | 11.9% | 29.4% |
-| HEIC | 14.3% | 26.9% | 78.3% |
+| 格式 |   q50 |   q75 |    q90 |
+| ---- | ----: | ----: | -----: |
+| BMP  |  1.2% |  1.7% |   3.8% |
+| GIF  |  8.6% | 11.9% |  29.4% |
+| HEIC | 14.3% | 26.9% |  78.3% |
 | JPEG | 38.9% | 57.4% | 100.0% |
-| PNG | 7.2% | 10.8% | 27.7% |
-| TIFF | 6.1% | 9.1% | 23.4% |
-| WebP | 25.7% | 39.2% | 89.9% |
+| PNG  |  7.2% | 10.8% |  27.7% |
+| TIFF |  6.1% |  9.1% |  23.4% |
+| WebP | 25.7% | 39.2% |  89.9% |
 
 数据解读：
 
@@ -114,9 +115,15 @@
 
 ```rust
 use media_compress::compress_image;
+use media_compress::CompressOptions;
 
 let input = std::fs::read("input.png")?;
-let out = compress_image(&input, 75.0)?;
+let options = CompressOptions {
+    quality: 75.0,
+    min_width: Some(1280),
+    min_height: Some(720),
+};
+let out = compress_image(&input, options)?;
 std::fs::write("out.webp", out)?;
 ```
 
@@ -126,7 +133,7 @@ std::fs::write("out.webp", out)?;
 import init, { compress_image_js } from './pkg/media_compress.js';
 
 await init();
-const out = await compress_image_js(inputBytes, 75);
+const out = await compress_image_js(inputBytes, 75, 1280, 720);
 // out 是 Uint8Array，通常为 WebP；Safari 等可能回退为 JPEG
 ```
 

@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 
+use super::{compute_target_dimensions, resize, CompressOptions};
 use super::webp_encode;
 use crate::error::Error;
 
@@ -415,7 +416,7 @@ unsafe fn get_gif_delay_ms(frame: *mut c_void) -> i32 {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
+pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     unsafe {
         // Initialize COM in apartment-threaded mode (idempotent for same thread)
         CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
@@ -516,8 +517,11 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
             let r = decode_wic_frame(factory, frame);
             com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
             let (pixels, w, h) = r?;
+            let (target_w, target_h) =
+                compute_target_dimensions(w, h, options.min_width, options.min_height);
+            let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
 
-            webp_encode::encode_static(&pixels, w, h, quality)
+            webp_encode::encode_static(&resized, target_w, target_h, options.quality)
         } else {
             // ── Animated (GIF, APNG, …) ─────────────────────────────────────
             // Get first frame to determine dimensions
@@ -541,11 +545,14 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
             let r0 = decode_wic_frame(factory, frame0);
             com_call!(frame0, 2, unsafe extern "system" fn(*mut c_void) -> u32);
             let (pixels0, w, h) = r0?;
+            let (target_w, target_h) =
+                compute_target_dimensions(w, h, options.min_width, options.min_height);
 
             // Collect all frame pixel data first so that every Vec<u8> lives
             // long enough for AnimEncoder (which borrows each slice).
             let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::with_capacity(frame_count as usize);
-            frame_data.push((pixels0, delay0));
+            let first_resized = resize::resize_rgba_nearest(&pixels0, w, h, target_w, target_h);
+            frame_data.push((first_resized, delay0));
 
             for i in 1..frame_count {
                 let mut frame: *mut c_void = std::ptr::null_mut();
@@ -564,10 +571,11 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
                 let r = decode_wic_frame(factory, frame);
                 com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
                 let (pixels, _, _) = r?;
-                frame_data.push((pixels, delay));
+                let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
+                frame_data.push((resized, delay));
             }
 
-            webp_encode::encode_animated(&frame_data, w, h, quality)
+            webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
         };
 
         com_call!(decoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);

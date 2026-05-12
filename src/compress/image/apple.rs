@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 
 use super::webp_encode;
+use super::{compute_target_dimensions, resize, CompressOptions};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -232,7 +233,7 @@ unsafe fn get_gif_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
+pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     unsafe {
         // Wrap raw bytes in a CFData — no copy, no allocator (null = default).
         let data_ref = CFDataCreate(std::ptr::null(), input.as_ptr(), input.len() as CFIndex);
@@ -258,26 +259,34 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
         let result = if count == 1 {
             // ── Static image ──────────────────────────────────────────────
             let (pixels, w, h) = decode_frame(src, 0)?;
-            webp_encode::encode_static(&pixels, w, h, quality)
+            let (target_w, target_h) =
+                compute_target_dimensions(w, h, options.min_width, options.min_height);
+            let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
+            webp_encode::encode_static(&resized, target_w, target_h, options.quality)
         } else {
             // ── Animated image (GIF, APNG, …) ─────────────────────────────
             // Get dimensions from first frame.
             let (first_pixels, w, h) = decode_frame(src, 0)?;
+            let (target_w, target_h) =
+                compute_target_dimensions(w, h, options.min_width, options.min_height);
 
             // Collect all frame pixel data first so that every Vec<u8> lives
             // long enough for AnimEncoder (which borrows each slice).
             let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::with_capacity(count);
 
             let delay0 = get_gif_delay_ms(src, 0);
-            frame_data.push((first_pixels, delay0));
+            let first_resized =
+                resize::resize_rgba_nearest(&first_pixels, w, h, target_w, target_h);
+            frame_data.push((first_resized, delay0));
 
             for i in 1..count {
                 let (pixels, _, _) = decode_frame(src, i)?;
                 let delay = get_gif_delay_ms(src, i);
-                frame_data.push((pixels, delay));
+                let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
+                frame_data.push((resized, delay));
             }
 
-            webp_encode::encode_animated(&frame_data, w, h, quality)
+            webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
         };
 
         CFRelease(src as CFTypeRef);

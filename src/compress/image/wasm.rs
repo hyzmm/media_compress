@@ -1,14 +1,21 @@
+use crate::compress::image::compute_target_dimensions;
+use crate::compress::image::CompressOptions;
 use crate::compress::image::ImageFormat;
 use crate::error::Error;
 use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Blob, ImageEncodeOptions, ImageBitmapRenderingContext, OffscreenCanvas};
+use web_sys::{Blob, ImageBitmapRenderingContext, ImageEncodeOptions, OffscreenCanvas};
 
 /// Decode raw image bytes with `createImageBitmap`, draw onto `OffscreenCanvas`,
 /// and re-encode to WebP (or JPEG if the browser lacks WebP encoder support).
-async fn canvas_compress(input: &[u8], quality: f32) -> Result<Uint8Array, JsValue> {
+async fn canvas_compress(
+    input: &[u8],
+    quality: f32,
+    min_width: Option<u32>,
+    min_height: Option<u32>,
+) -> Result<Uint8Array, JsValue> {
     let bytes = Uint8Array::from(input);
     let array = js_sys::Array::of1(&bytes);
 
@@ -16,10 +23,15 @@ async fn canvas_compress(input: &[u8], quality: f32) -> Result<Uint8Array, JsVal
     let bitmap = {
         let window = web_sys::window().expect("no window");
         let promise = window.create_image_bitmap_with_blob(&blob)?;
-        JsFuture::from(promise).await?.dyn_into::<web_sys::ImageBitmap>()?
+        JsFuture::from(promise)
+            .await?
+            .dyn_into::<web_sys::ImageBitmap>()?
     };
 
-    let canvas = OffscreenCanvas::new(bitmap.width(), bitmap.height())?;
+    let (target_w, target_h) =
+        compute_target_dimensions(bitmap.width(), bitmap.height(), min_width, min_height);
+
+    let canvas = OffscreenCanvas::new(target_w, target_h)?;
     let ctx = canvas
         .get_context("bitmaprenderer")?
         .expect("bitmaprenderer context not available")
@@ -59,20 +71,27 @@ async fn canvas_compress(input: &[u8], quality: f32) -> Result<Uint8Array, JsVal
 /// # Arguments
 /// * `input`   — raw bytes of the source image
 /// * `quality` — WebP lossy quality, 0–100
+/// * `min_width` / `min_height` — optional lower bound for output dimensions.
+///   The output keeps the original aspect ratio and never upscales.
 ///
 /// # JS usage
 /// ```js
 /// import init, { compress_image_js } from './media_compress.js';
 /// await init();
-/// const webpBytes = await compress_image_js(imageBytes, 75);
+/// const webpBytes = await compress_image_js(imageBytes, 75, 1280, 720);
 /// ```
 #[wasm_bindgen]
-pub async fn compress_image_js(input: &[u8], quality: f32) -> Result<Uint8Array, JsValue> {
+pub async fn compress_image_js(
+    input: &[u8],
+    quality: f32,
+    min_width: Option<u32>,
+    min_height: Option<u32>,
+) -> Result<Uint8Array, JsValue> {
     let may_fallback =
         ImageFormat::detect(input).map_or(false, |fmt| fmt.should_use_original_if_larger());
 
     let js_bytes = Uint8Array::from(input);
-    let compressed = canvas_compress(input, quality).await?;
+    let compressed = canvas_compress(input, quality, min_width, min_height).await?;
 
     if may_fallback && compressed.length() as usize > input.len() {
         return Ok(js_bytes);
@@ -82,7 +101,7 @@ pub async fn compress_image_js(input: &[u8], quality: f32) -> Result<Uint8Array,
 
 /// Synchronous path — always returns `PlatformNotSupported`.
 /// Call [`compress_image_js`] (async) on the Web platform instead.
-pub fn compress(_input: &[u8], _quality: f32) -> Result<Vec<u8>, Error> {
+pub fn compress(_input: &[u8], _options: CompressOptions) -> Result<Vec<u8>, Error> {
     Err(Error::PlatformNotSupported(
         "Use compress_image_js() (async) on the Web platform".into(),
     ))

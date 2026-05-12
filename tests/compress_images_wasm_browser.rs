@@ -39,7 +39,7 @@ fn detect_format(bytes: &[u8]) -> &'static str {
 
 /// Compress, log stats including detected output format, return bytes.
 async fn compress_and_log(label: &str, input: &[u8], quality: f32) -> Result<Vec<u8>, JsValue> {
-    let out = compress_image_js(input, quality).await?.to_vec();
+    let out = compress_image_js(input, quality, None, None).await?.to_vec();
     let ratio = out.len() as f64 / input.len() as f64 * 100.0;
     web_sys::console::log_1(
         &format!(

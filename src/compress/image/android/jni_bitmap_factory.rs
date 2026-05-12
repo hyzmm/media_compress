@@ -4,7 +4,9 @@ use jni::sys::{jint, jobject, JNIEnv as JNIEnvRaw};
 use jni::JNIEnv;
 use jni::JavaVM;
 
+use crate::compress::image::resize;
 use crate::compress::image::ImageFormat;
+use crate::compress::image::{compute_target_dimensions, CompressOptions};
 use crate::error::Error;
 
 const ANDROID_BITMAP_RESULT_SUCCESS: i32 = 0;
@@ -34,9 +36,12 @@ extern "C" {
     fn AndroidBitmap_unlockPixels(env: *mut JNIEnvRaw, bitmap: jobject) -> i32;
 }
 
-pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
+pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     let (rgba, w, h) = decode_to_rgba(input)?;
-    webp_encode::encode_static(&rgba, w, h, quality)
+    let (target_w, target_h) =
+        compute_target_dimensions(w, h, options.min_width, options.min_height);
+    let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
+    webp_encode::encode_static(&resized, target_w, target_h, options.quality)
 }
 
 fn decode_to_rgba(input: &[u8]) -> Result<(Vec<u8>, u32, u32), Error> {

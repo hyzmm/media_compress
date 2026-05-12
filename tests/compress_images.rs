@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use media_compress::compress_image;
+use media_compress::{compress_image, CompressOptions};
 
 /// Integration test: compress every file under `test_images/` to WebP and
 /// write results to `out_images/`.
@@ -62,6 +62,9 @@ fn compress_all_test_images() {
     for entry in &entries {
         let path = entry.path();
         let file_name = path.file_name().unwrap().to_string_lossy();
+        if file_name == ".DS_Store" {
+            continue;
+        }
 
         let data = fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", file_name, e));
 
@@ -69,7 +72,7 @@ fn compress_all_test_images() {
         eprintln!("  COMPRESS  {}  size: {} bytes", file_name, original_size);
 
         let t0 = Instant::now();
-        match compress_image(&data, 75.0) {
+        match compress_image(&data, CompressOptions::new(75.0)) {
             Ok(webp_bytes) => {
                 let elapsed = t0.elapsed();
                 assert!(

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use media_compress::{compress_image, ImageFormat};
+use media_compress::{compress_image, CompressOptions, ImageFormat};
 
 fn project_base_dir() -> PathBuf {
     let compile_time = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -105,7 +105,7 @@ fn compare_quality_profiles() {
             .or_insert_with(|| vec![Aggregate::default(); qualities.len()]);
 
         for (i, quality) in qualities.iter().enumerate() {
-            match compress_image(&input, *quality) {
+            match compress_image(&input, CompressOptions::new(*quality)) {
                 Ok(out) => {
                     total_aggs[i].record(input.len(), out.len());
                     format_aggs[i].record(input.len(), out.len());

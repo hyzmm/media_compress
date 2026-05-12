@@ -1,7 +1,9 @@
 use std::ffi::{c_char, c_void};
 use std::sync::OnceLock;
 
+use crate::compress::image::resize;
 use crate::compress::image::webp_encode;
+use crate::compress::image::{compute_target_dimensions, CompressOptions};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -56,18 +58,15 @@ extern "C" {
 type CreateFromBufferFn =
     unsafe extern "C" fn(*const c_void, usize, *mut *mut AImageDecoder) -> i32;
 type DeleteFn = unsafe extern "C" fn(*mut AImageDecoder);
-type GetHeaderInfoFn =
-    unsafe extern "C" fn(*const AImageDecoder) -> *const AImageDecoderHeaderInfo;
+type GetHeaderInfoFn = unsafe extern "C" fn(*const AImageDecoder) -> *const AImageDecoderHeaderInfo;
 type HeaderGetWidthFn = unsafe extern "C" fn(*const AImageDecoderHeaderInfo) -> i32;
 type HeaderGetHeightFn = unsafe extern "C" fn(*const AImageDecoderHeaderInfo) -> i32;
 type SetBitmapFormatFn = unsafe extern "C" fn(*mut AImageDecoder, i32) -> i32;
 type GetMinimumStrideFn = unsafe extern "C" fn(*mut AImageDecoder) -> usize;
-type DecodeImageFn =
-    unsafe extern "C" fn(*mut AImageDecoder, *mut c_void, usize, usize) -> i32;
+type DecodeImageFn = unsafe extern "C" fn(*mut AImageDecoder, *mut c_void, usize, usize) -> i32;
 type IsAnimatedFn = unsafe extern "C" fn(*mut AImageDecoder) -> i32;
 type AdvanceFrameFn = unsafe extern "C" fn(*mut AImageDecoder) -> i32;
-type FrameInfoCreateFn =
-    unsafe extern "C" fn(*mut AImageDecoder) -> *mut AImageDecoderFrameInfo;
+type FrameInfoCreateFn = unsafe extern "C" fn(*mut AImageDecoder) -> *mut AImageDecoderFrameInfo;
 type FrameInfoGetDurationFn = unsafe extern "C" fn(*const AImageDecoderFrameInfo) -> i64;
 type FrameInfoDeleteFn = unsafe extern "C" fn(*mut AImageDecoderFrameInfo);
 
@@ -130,9 +129,7 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
             AImageDecoder_getHeaderInfo: load!("AImageDecoder_getHeaderInfo"),
             AImageDecoderHeaderInfo_getWidth: load!("AImageDecoderHeaderInfo_getWidth"),
             AImageDecoderHeaderInfo_getHeight: load!("AImageDecoderHeaderInfo_getHeight"),
-            AImageDecoder_setAndroidBitmapFormat: load!(
-                "AImageDecoder_setAndroidBitmapFormat"
-            ),
+            AImageDecoder_setAndroidBitmapFormat: load!("AImageDecoder_setAndroidBitmapFormat"),
             AImageDecoder_getMinimumStride: load!("AImageDecoder_getMinimumStride"),
             AImageDecoder_decodeImage: load!("AImageDecoder_decodeImage"),
             AImageDecoder_isAnimated: load!("AImageDecoder_isAnimated"),
@@ -148,7 +145,7 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
+pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     let api = match api() {
         Some(a) => a,
         None => {
@@ -194,9 +191,11 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
             return Err(Error::DecodeError("Image has zero dimensions".into()));
         }
 
+        let (target_w, target_h) =
+            compute_target_dimensions(w, h, options.min_width, options.min_height);
+
         // ── Force RGBA_8888 output ─────────────────────────────────────────
-        let ret =
-            (api.AImageDecoder_setAndroidBitmapFormat)(dec, ANDROID_BITMAP_FORMAT_RGBA_8888);
+        let ret = (api.AImageDecoder_setAndroidBitmapFormat)(dec, ANDROID_BITMAP_FORMAT_RGBA_8888);
         if ret != ANDROID_IMAGE_DECODER_SUCCESS {
             (api.AImageDecoder_delete)(dec);
             return Err(Error::DecodeError(format!(
@@ -234,7 +233,8 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
             }
             // stride may be wider than w*4; slice to exact RGBA rows
             let rgba = compact_rgba(&buf, w, h, stride);
-            webp_encode::encode_static(&rgba, w, h, quality)
+            let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
+            webp_encode::encode_static(&resized, target_w, target_h, options.quality)
         } else {
             // ── Animated ────────────────────────────────────────────────────
             let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::new();
@@ -265,6 +265,7 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
                 is_first = false;
 
                 let rgba = compact_rgba(&buf, w, h, stride);
+                let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
 
                 // Read frame duration before advancing
                 let fi = (api.AImageDecoderFrameInfo_create)(dec);
@@ -276,7 +277,7 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
                     ((ns / 1_000_000) as i32).max(10)
                 };
 
-                frame_data.push((rgba, delay_ms));
+                frame_data.push((resized, delay_ms));
 
                 let adv = (api.AImageDecoder_advanceFrame)(dec);
                 if adv != ANDROID_IMAGE_DECODER_SUCCESS {
@@ -284,7 +285,7 @@ pub fn compress(input: &[u8], quality: f32) -> Result<Vec<u8>, Error> {
                 }
             }
 
-            webp_encode::encode_animated(&frame_data, w, h, quality)
+            webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
         };
 
         (api.AImageDecoder_delete)(dec);
