@@ -3,6 +3,72 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use media_compress::{compress_image, CompressOptions};
+use webp::BitstreamFeatures;
+
+fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let features = BitstreamFeatures::new(bytes)?;
+    Some((features.width(), features.height()))
+}
+
+#[test]
+fn compress_with_min_1080_dimensions() {
+    let input = include_bytes!("../test_images/test_image.bmp");
+
+    let original =
+        compress_image(input, CompressOptions::new(75.0)).expect("compress_image baseline failed");
+    let (ow, oh) = webp_dimensions(&original).expect("failed to parse baseline WebP dimensions");
+    assert!(
+        ow > 1080 && oh > 1080,
+        "fixture should be larger than 1080x1080, got {ow}x{oh}"
+    );
+
+    let mut options = CompressOptions::new(75.0);
+    options.min_width = Some(1080);
+    options.min_height = Some(1080);
+
+    let constrained =
+        compress_image(input, options).expect("compress_image with min 1080x1080 failed");
+    let (cw, ch) =
+        webp_dimensions(&constrained).expect("failed to parse constrained WebP dimensions");
+
+    assert!(
+        cw >= 1080 && ch >= 1080,
+        "expected output >=1080x1080, got {cw}x{ch}"
+    );
+    assert!(
+        cw <= ow && ch <= oh,
+        "expected output no larger than baseline {ow}x{oh}, got {cw}x{ch}"
+    );
+    assert!(
+        cw < ow || ch < oh,
+        "expected at least one dimension to shrink from baseline {ow}x{oh}, got {cw}x{ch}"
+    );
+}
+
+#[test]
+fn compress_test_image_gif_with_min_1080() {
+    let input = include_bytes!("../test_images/test_image.gif");
+
+    let original = compress_image(input, CompressOptions::new(75.0))
+        .expect("compress_image gif baseline failed");
+    let (ow, oh) =
+        webp_dimensions(&original).expect("failed to parse gif baseline WebP dimensions");
+
+    let mut options = CompressOptions::new(75.0);
+    options.min_width = Some(1080);
+    options.min_height = Some(1080);
+
+    let constrained =
+        compress_image(input, options).expect("compress_image gif with min 1080x1080 failed");
+    let (cw, ch) =
+        webp_dimensions(&constrained).expect("failed to parse gif constrained WebP dimensions");
+
+    assert_eq!(
+        (cw, ch),
+        (ow, oh),
+        "gif should not upscale when both min dimensions are 1080; got baseline {ow}x{oh}, constrained {cw}x{ch}"
+    );
+}
 
 /// Integration test: compress every file under `test_images/` to WebP and
 /// write results to `out_images/`.

@@ -112,6 +112,10 @@ pub(crate) fn compute_target_dimensions(
         return (src_w, src_h);
     }
 
+    if min_width.is_none() && min_height.is_none() {
+        return (src_w, src_h);
+    }
+
     let req_w = min_width.map_or(0.0, |w| w as f64 / src_w as f64);
     let req_h = min_height.map_or(0.0, |h| h as f64 / src_h as f64);
 
@@ -178,6 +182,14 @@ pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::compute_target_dimensions;
+
+    #[test]
+    fn no_min_constraints_keep_original_dimensions() {
+        assert_eq!(
+            compute_target_dimensions(3456, 4608, None, None),
+            (3456, 4608)
+        );
+    }
 
     #[test]
     fn only_shrink_never_upscale() {
