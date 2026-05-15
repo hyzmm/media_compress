@@ -5,6 +5,9 @@ use crate::error::Error;
 mod webp_encode;
 
 #[cfg(not(target_arch = "wasm32"))]
+mod orientation;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod resize;
 
 // Platform-specific decoder modules

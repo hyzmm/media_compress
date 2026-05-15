@@ -70,6 +70,56 @@ fn compress_test_image_gif_with_min_1080() {
     );
 }
 
+#[test]
+fn compress_exif_rotate_90_heic_to_out_images() {
+    let base_dir = {
+        let compile_time = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if compile_time.exists() {
+            compile_time
+        } else {
+            std::env::current_dir().expect("cannot determine current directory")
+        }
+    };
+
+    let input_path = {
+        let direct = base_dir.join("test_images").join("exif-rotate-90.HEIC");
+        if direct.exists() {
+            direct
+        } else {
+            base_dir
+                .join("test_data")
+                .join("test_images")
+                .join("exif-rotate-90.HEIC")
+        }
+    };
+    let output_dir = base_dir.join("out_images");
+
+    assert!(
+        input_path.exists(),
+        "missing test fixture: {}",
+        input_path.display()
+    );
+
+    fs::create_dir_all(&output_dir).expect("failed to create out_images/");
+
+    let input = fs::read(&input_path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", input_path.display(), e));
+
+    let webp_bytes = compress_image(&input, CompressOptions::new(75.0))
+        .expect("compress_image failed for exif-rotate-90.HEIC");
+    assert!(!webp_bytes.is_empty(), "compressed output is empty");
+
+    let (w, h) = webp_dimensions(&webp_bytes).expect("failed to parse output WebP dimensions");
+    assert!(
+        h > w,
+        "expected EXIF-rotated output to be portrait, got {w}x{h}"
+    );
+
+    let out_path = output_dir.join("exif-rotate-90.HEIC.webp");
+    fs::write(&out_path, &webp_bytes)
+        .unwrap_or_else(|e| panic!("cannot write {}: {}", out_path.display(), e));
+}
+
 /// Integration test: compress every file under `test_images/` to WebP and
 /// write results to `out_images/`.
 ///

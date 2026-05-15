@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 
 use super::{compute_target_dimensions, resize, CompressOptions};
+use super::orientation::apply_exif_orientation_rgba;
 use super::webp_encode;
 use crate::error::Error;
 
@@ -91,6 +92,7 @@ struct PROPVARIANT {
 #[repr(C)]
 union PropVariantVal {
     ui_val: u16,   // VT_UI2
+    ul_val: u32,   // VT_UI4
     i_val: i16,    // VT_I2
     raw: [u8; 16], // ensure enough space for any PROPVARIANT value
 }
@@ -108,6 +110,7 @@ impl PROPVARIANT {
 }
 
 const VT_UI2: u16 = 18;
+const VT_UI4: u16 = 19;
 
 // ---------------------------------------------------------------------------
 // COM vtable helpers — IUnknown base
@@ -412,6 +415,58 @@ unsafe fn get_gif_delay_ms(frame: *mut c_void) -> i32 {
     (hundredths * 10).max(10)
 }
 
+/// Read image orientation via WIC metadata query reader.
+/// Returns EXIF orientation in 1..=8, or 1 when not present.
+unsafe fn get_frame_orientation(frame: *mut c_void) -> u32 {
+    let mut mqr: *mut c_void = std::ptr::null_mut();
+    let hr: HRESULT = com_call!(
+        frame,
+        WIC_FRAME_GET_METADATA_QUERY_READER,
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        &mut mqr
+    );
+    if hr != S_OK || mqr.is_null() {
+        return 1;
+    }
+
+    // Most decoders expose orientation at "/ifd/{ushort=274}".
+    // Some JPEG decoders nest it under APP1.
+    let orientation = query_orientation_from_path(mqr, "/ifd/{ushort=274}\0")
+        .or_else(|| query_orientation_from_path(mqr, "/app1/ifd/{ushort=274}\0"))
+        .unwrap_or(1);
+
+    com_call!(mqr, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+    orientation
+}
+
+unsafe fn query_orientation_from_path(mqr: *mut c_void, path: &str) -> Option<u32> {
+    let mut pv = PROPVARIANT::zero();
+    let path_wide: Vec<u16> = path.encode_utf16().collect();
+
+    let hr: HRESULT = com_call!(
+        mqr,
+        WIC_METADATA_GET_BY_NAME,
+        unsafe extern "system" fn(*mut c_void, *const u16, *mut PROPVARIANT) -> HRESULT,
+        path_wide.as_ptr(),
+        &mut pv
+    );
+    if hr != S_OK {
+        return None;
+    }
+
+    let value = match pv.vt {
+        VT_UI2 => pv.val.ui_val as u32,
+        VT_UI4 => pv.val.ul_val,
+        _ => return None,
+    };
+
+    if (1..=8).contains(&value) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -514,9 +569,11 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
                 )));
             }
 
+            let orientation = get_frame_orientation(frame);
             let r = decode_wic_frame(factory, frame);
             com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
             let (pixels, w, h) = r?;
+            let (pixels, w, h) = apply_exif_orientation_rgba(pixels, w, h, orientation);
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);

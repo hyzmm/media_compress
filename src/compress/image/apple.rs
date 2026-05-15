@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 
+use super::orientation::apply_exif_orientation_rgba;
 use super::webp_encode;
 use super::{compute_target_dimensions, resize, CompressOptions};
 use crate::error::Error;
@@ -54,6 +55,8 @@ const BITMAP_INFO: u32 = 0x2002;
 
 /// CFNumberType: kCFNumberFloat64Type = 13
 const CF_NUMBER_FLOAT64_TYPE: i32 = 13;
+/// CFNumberType: kCFNumberSInt32Type = 3
+const CF_NUMBER_SINT32_TYPE: i32 = 3;
 
 const DEFAULT_DELAY_MS: i32 = 100;
 
@@ -96,6 +99,7 @@ extern "C" {
 
     static kCGImagePropertyGIFDictionary: CFStringRef;
     static kCGImagePropertyGIFDelayTime: CFStringRef;
+    static kCGImagePropertyOrientation: CFStringRef;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +196,41 @@ unsafe fn decode_frame(src: CGImageSourceRef, index: usize) -> Result<(Vec<u8>, 
         chunk.swap(0, 2); // BGRA → RGBA
     }
 
-    Ok((pixels, w as u32, h as u32))
+    let orientation = get_frame_orientation(src, index);
+    Ok(apply_exif_orientation_rgba(
+        pixels,
+        w as u32,
+        h as u32,
+        orientation,
+    ))
+}
+
+unsafe fn get_frame_orientation(src: CGImageSourceRef, index: usize) -> u32 {
+    let props = CGImageSourceCopyPropertiesAtIndex(src, index, std::ptr::null());
+    if props.is_null() {
+        return 1;
+    }
+
+    let value = CFDictionaryGetValue(props, kCGImagePropertyOrientation as CFTypeRef);
+    if value.is_null() {
+        CFRelease(props as CFTypeRef);
+        return 1;
+    }
+
+    let mut orientation: i32 = 1;
+    let ok = CFNumberGetValue(
+        value as CFNumberRef,
+        CF_NUMBER_SINT32_TYPE,
+        &mut orientation as *mut i32 as *mut c_void,
+    );
+
+    CFRelease(props as CFTypeRef);
+
+    if ok == 0 {
+        1
+    } else {
+        (orientation as u32).clamp(1, 8)
+    }
 }
 
 /// Read the GIF frame delay for frame at `index` from the image source.

@@ -1,3 +1,4 @@
+use crate::compress::image::orientation::apply_exif_orientation_rgba;
 use crate::compress::image::webp_encode;
 use jni::objects::{JByteArray, JObject, JValue};
 use jni::sys::{jint, jobject, JNIEnv as JNIEnvRaw};
@@ -38,6 +39,8 @@ extern "C" {
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     let (rgba, w, h) = decode_to_rgba(input)?;
+    let orientation = super::orientation_from_metadata_jni(input);
+    let (rgba, w, h) = apply_exif_orientation_rgba(rgba, w, h, orientation);
     let (target_w, target_h) =
         compute_target_dimensions(w, h, options.min_width, options.min_height);
     let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
