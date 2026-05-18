@@ -71,7 +71,7 @@ fn compress_test_image_gif_with_min_1080() {
 }
 
 #[test]
-fn compress_exif_rotate_90_heic_to_out_images() {
+fn compress_exif_rotate_90_jpg_to_out_images() {
     let base_dir = {
         let compile_time = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         if compile_time.exists() {
@@ -82,14 +82,14 @@ fn compress_exif_rotate_90_heic_to_out_images() {
     };
 
     let input_path = {
-        let direct = base_dir.join("test_images").join("exif-rotate-90.HEIC");
+        let direct = base_dir.join("test_images").join("portrait_2.jpg");
         if direct.exists() {
             direct
         } else {
             base_dir
                 .join("test_data")
                 .join("test_images")
-                .join("exif-rotate-90.HEIC")
+                .join("portrait_2.jpg")
         }
     };
     let output_dir = base_dir.join("out_images");
@@ -106,7 +106,7 @@ fn compress_exif_rotate_90_heic_to_out_images() {
         .unwrap_or_else(|e| panic!("cannot read {}: {}", input_path.display(), e));
 
     let webp_bytes = compress_image(&input, CompressOptions::new(75.0))
-        .expect("compress_image failed for exif-rotate-90.HEIC");
+        .expect("compress_image failed for portrait_2.jpg");
     assert!(!webp_bytes.is_empty(), "compressed output is empty");
 
     let (w, h) = webp_dimensions(&webp_bytes).expect("failed to parse output WebP dimensions");
@@ -115,7 +115,7 @@ fn compress_exif_rotate_90_heic_to_out_images() {
         "expected EXIF-rotated output to be portrait, got {w}x{h}"
     );
 
-    let out_path = output_dir.join("exif-rotate-90.HEIC.webp");
+    let out_path = output_dir.join("portrait_2.jpg.webp");
     fs::write(&out_path, &webp_bytes)
         .unwrap_or_else(|e| panic!("cannot write {}: {}", out_path.display(), e));
 }

@@ -7,15 +7,17 @@ use crate::error::Error;
 use jni::objects::JValue;
 use jni::JavaVM;
 
-/// Compress an image. Tries AImageDecoder first (API 28+), falls back to
-/// JNI BitmapFactory on failure.
+/// Compress an image. Uses AImageDecoder (API 30+) when available,
+/// falls back to JNI BitmapFactory on older devices.
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
-    a_image_decoder::compress(input, options)
-        .or_else(|_| jni_bitmap_factory::compress(input, options))
+    match a_image_decoder::compress(input, options) {
+        Err(Error::PlatformNotSupported(_)) => jni_bitmap_factory::compress(input, options),
+        other => other,
+    }
 }
 
-/// JNI-based orientation retrieval for jni_bitmap_factory.
-pub(super) fn orientation_from_metadata_jni(input: &[u8]) -> u32 {
+/// JNI-based orientation retrieval via Android's `ExifInterface`.
+pub fn orientation_from_metadata_jni(input: &[u8]) -> u32 {
     let vm_ptr = crate::android_runtime::java_vm_ptr()
         .or_else(|| try_android_context().map(|ctx| ctx.vm() as *mut jni::sys::JavaVM));
 

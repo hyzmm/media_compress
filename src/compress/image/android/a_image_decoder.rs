@@ -40,15 +40,14 @@ const ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT: i32 = -6;
 const DEFAULT_DELAY_MS: i32 = 100;
 
 // ---------------------------------------------------------------------------
-// Dynamic loading — avoids static symbol references so the binary can load
-// on API < 28 devices. Symbols are resolved at call time via dlsym.
+// Dynamic loading — AImageDecoder lives in libjnigraphics.so (API 30+).
+// Using dlopen/dlsym so the binary can still load on API < 30 devices
+// (where the symbols are absent); those devices fall back to JNI BitmapFactory.
 //
-// On API 28-33, AImageDecoder symbols are in libmediandk.so.
-// On API 34+, they're in libandroid.so (always loaded → RTLD_DEFAULT works).
-// We try RTLD_DEFAULT first, then fall back to dlopen("libmediandk.so").
+// Animation helpers (AImageDecoder_isAnimated etc.) require API 31+, so they
+// are loaded as Option and treated as absent when missing.
 // ---------------------------------------------------------------------------
 
-const RTLD_DEFAULT: *mut c_void = 0 as *mut c_void;
 const RTLD_NOW: i32 = 2;
 
 extern "C" {
@@ -77,6 +76,7 @@ type FrameInfoDeleteFn = unsafe extern "C" fn(*mut AImageDecoderFrameInfo);
 
 #[allow(non_snake_case)]
 struct Api {
+    // Core decode functions — present on API 30+
     AImageDecoder_createFromBuffer: CreateFromBufferFn,
     AImageDecoder_delete: DeleteFn,
     AImageDecoder_getHeaderInfo: GetHeaderInfoFn,
@@ -85,11 +85,12 @@ struct Api {
     AImageDecoder_setAndroidBitmapFormat: SetBitmapFormatFn,
     AImageDecoder_getMinimumStride: GetMinimumStrideFn,
     AImageDecoder_decodeImage: DecodeImageFn,
-    AImageDecoder_isAnimated: IsAnimatedFn,
-    AImageDecoder_advanceFrame: AdvanceFrameFn,
-    AImageDecoderFrameInfo_create: FrameInfoCreateFn,
-    AImageDecoderFrameInfo_getDuration: FrameInfoGetDurationFn,
-    AImageDecoderFrameInfo_delete: FrameInfoDeleteFn,
+    // Animation helpers — present on API 31+ only
+    AImageDecoder_isAnimated: Option<IsAnimatedFn>,
+    AImageDecoder_advanceFrame: Option<AdvanceFrameFn>,
+    AImageDecoderFrameInfo_create: Option<FrameInfoCreateFn>,
+    AImageDecoderFrameInfo_getDuration: Option<FrameInfoGetDurationFn>,
+    AImageDecoderFrameInfo_delete: Option<FrameInfoDeleteFn>,
 }
 
 unsafe impl Send for Api {}
@@ -101,18 +102,15 @@ fn api() -> Option<&'static Api> {
 }
 
 fn try_load() -> Option<Api> {
+    // AImageDecoder is in libjnigraphics.so on API 30+.
+    // dlopen returns null on API < 30 (symbol absent) → api() returns None
+    // and the caller falls back to JNI BitmapFactory.
     unsafe {
-        // Try RTLD_DEFAULT first (covers libandroid.so on API 34+).
-        let handle = try_load_from(RTLD_DEFAULT);
-        if handle.is_some() {
-            return handle;
-        }
-        // Fall back to dlopen("libmediandk.so") for API 28-33.
-        let mediandk = dlopen(c"libmediandk.so".as_ptr(), RTLD_NOW);
-        if mediandk.is_null() {
+        let handle = dlopen(c"libjnigraphics.so".as_ptr(), RTLD_NOW);
+        if handle.is_null() {
             return None;
         }
-        try_load_from(mediandk)
+        try_load_from(handle)
     }
 }
 
@@ -127,6 +125,16 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
                 std::mem::transmute::<*mut c_void, _>(ptr)
             }};
         }
+        macro_rules! load_opt {
+            ($name:expr) => {{
+                let ptr = dlsym(handle, concat!($name, "\0").as_ptr() as *const c_char);
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute::<*mut c_void, _>(ptr))
+                }
+            }};
+        }
 
         Some(Api {
             AImageDecoder_createFromBuffer: load!("AImageDecoder_createFromBuffer"),
@@ -137,11 +145,11 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
             AImageDecoder_setAndroidBitmapFormat: load!("AImageDecoder_setAndroidBitmapFormat"),
             AImageDecoder_getMinimumStride: load!("AImageDecoder_getMinimumStride"),
             AImageDecoder_decodeImage: load!("AImageDecoder_decodeImage"),
-            AImageDecoder_isAnimated: load!("AImageDecoder_isAnimated"),
-            AImageDecoder_advanceFrame: load!("AImageDecoder_advanceFrame"),
-            AImageDecoderFrameInfo_create: load!("AImageDecoderFrameInfo_create"),
-            AImageDecoderFrameInfo_getDuration: load!("AImageDecoderFrameInfo_getDuration"),
-            AImageDecoderFrameInfo_delete: load!("AImageDecoderFrameInfo_delete"),
+            AImageDecoder_isAnimated: load_opt!("AImageDecoder_isAnimated"),
+            AImageDecoder_advanceFrame: load_opt!("AImageDecoder_advanceFrame"),
+            AImageDecoderFrameInfo_create: load_opt!("AImageDecoderFrameInfo_create"),
+            AImageDecoderFrameInfo_getDuration: load_opt!("AImageDecoderFrameInfo_getDuration"),
+            AImageDecoderFrameInfo_delete: load_opt!("AImageDecoderFrameInfo_delete"),
         })
     }
 }
@@ -155,10 +163,11 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
         Some(a) => a,
         None => {
             return Err(Error::PlatformNotSupported(
-                "AImageDecoder not available on this device (requires API 28+)".into(),
+                "AImageDecoder not available on this device (requires API 30+)".into(),
             ));
         }
     };
+
     let orientation = exif_orientation_from_bytes(input);
 
     unsafe {
@@ -215,7 +224,24 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
         let mut buf = vec![0u8; buf_size];
 
         // ── Animated or static? ────────────────────────────────────────────
-        let animated = (api.AImageDecoder_isAnimated)(dec) != 0;
+        // AImageDecoder_isAnimated requires API 31+.
+        // On API 30 (None): GIF is always potentially animated, so reject it
+        // explicitly rather than silently returning only the first frame.
+        let animated = match api.AImageDecoder_isAnimated {
+            Some(is_anim) => is_anim(dec) != 0,
+            None => {
+                if matches!(
+                    crate::compress::image::ImageFormat::detect(input),
+                    Some(crate::compress::image::ImageFormat::Gif)
+                ) {
+                    (api.AImageDecoder_delete)(dec);
+                    return Err(Error::PlatformNotSupported(
+                        "GIF is not supported on this device (requires API 31+)".into(),
+                    ));
+                }
+                false
+            }
+        };
 
         let result = if !animated {
             // ── Static ──────────────────────────────────────────────────────
@@ -246,6 +272,23 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             webp_encode::encode_static(&resized, target_w, target_h, options.quality)
         } else {
             // ── Animated ────────────────────────────────────────────────────
+            // Animation helpers require API 31+; if absent, return error so
+            // the caller can fall back to JNI BitmapFactory (static only).
+            if api.AImageDecoder_advanceFrame.is_none()
+                || api.AImageDecoderFrameInfo_create.is_none()
+                || api.AImageDecoderFrameInfo_getDuration.is_none()
+                || api.AImageDecoderFrameInfo_delete.is_none()
+            {
+                (api.AImageDecoder_delete)(dec);
+                return Err(Error::PlatformNotSupported(
+                    "AImageDecoder animation functions not available on this device".into(),
+                ));
+            }
+            let advance_frame = api.AImageDecoder_advanceFrame.unwrap();
+            let frame_info_create = api.AImageDecoderFrameInfo_create.unwrap();
+            let frame_info_gd = api.AImageDecoderFrameInfo_getDuration.unwrap();
+            let frame_info_delete = api.AImageDecoderFrameInfo_delete.unwrap();
+
             let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::new();
             let mut is_first = true;
 
@@ -277,18 +320,18 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
                 let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
 
                 // Read frame duration before advancing
-                let fi = (api.AImageDecoderFrameInfo_create)(dec);
+                let fi = frame_info_create(dec);
                 let delay_ms = if fi.is_null() {
                     DEFAULT_DELAY_MS
                 } else {
-                    let ns = (api.AImageDecoderFrameInfo_getDuration)(fi);
-                    (api.AImageDecoderFrameInfo_delete)(fi);
+                    let ns = frame_info_gd(fi);
+                    frame_info_delete(fi);
                     ((ns / 1_000_000) as i32).max(10)
                 };
 
                 frame_data.push((resized, delay_ms));
 
-                let adv = (api.AImageDecoder_advanceFrame)(dec);
+                let adv = advance_frame(dec);
                 if adv != ANDROID_IMAGE_DECODER_SUCCESS {
                     break;
                 }

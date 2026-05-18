@@ -12,6 +12,9 @@ pub fn init_android_java_vm(vm: *mut jni::sys::JavaVM) {
     android_runtime::init_java_vm(vm);
 }
 
+#[cfg(target_os = "android")]
+pub use compress::image::android::orientation_from_metadata_jni;
+
 /// On the Web/WASM platform, use this async function instead of `compress_image`.
 #[cfg(target_arch = "wasm32")]
 pub use compress::image::wasm::compress_image_js;

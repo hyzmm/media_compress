@@ -15,7 +15,7 @@ pub(crate) mod resize;
 mod apple;
 
 #[cfg(target_os = "android")]
-mod android;
+pub mod android;
 
 #[cfg(target_os = "windows")]
 mod windows;
