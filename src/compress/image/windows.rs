@@ -632,7 +632,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
                 frame_data.push((resized, delay));
             }
 
-            webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
+            webp_encode::encode_animated(&webp_encode::merge_frames_min_delay(frame_data), target_w, target_h, options.quality)
         };
 
         com_call!(decoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);

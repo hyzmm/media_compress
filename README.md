@@ -22,11 +22,11 @@
 
 - Windows
     - 解码：WIC（Windows Imaging Component）
-    - 动图：读取多帧与元数据延迟，编码为 Animated WebP
+    - 动图：读取多帧与元数据延迟，编码为 Animated WebP，支持帧合并与最小延迟优化
 
 - Android
-    - 首选：AImageDecoder（动态加载，API 28+）
-    - 回退：JNI BitmapFactory（用于低版本或 AImageDecoder 不可用场景）。JNI 回退链路依赖可用的 `JavaVM`，宿主需在库加载时完成初始化（见下方“Android 集成与初始化”）
+    - 首选：AImageDecoder（动态加载，API 30+）
+    - 回退：JNI BitmapFactory（用于低版本或 AImageDecoder 不可用场景）。JNI 回退链路依赖可用的 `JavaVM`，宿主需在库加载时完成初始化（见下方"Android 集成与初始化"）
 
 - Web / WASM
     - 解码：`createImageBitmap`
@@ -39,7 +39,10 @@
 - 质量参数：`quality` 取值 0-100（常用 75）
 - 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
 - Native 编码配置：有损 WebP + 多线程
-- 动图处理：保留帧序与延迟，输出 Animated WebP
+- 动图处理：
+    - 保留帧序与延迟
+    - 支持帧合并优化：自动合并指定最小延迟阈值以下的连续帧，减少文件大小
+    - 输出 Animated WebP
 
 ## 各平台图片格式支持情况
 
@@ -139,34 +142,18 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 
 ## Android 集成与初始化
 
-从本次更新开始，Android 的 JNI BitmapFactory 回退链路会优先使用宿主注入的 `JavaVM`。
-如果宿主未触发 JNI 初始化，可能出现如下错误：
+本库在 Android 平台使用两条解码链路：
+
+### 主链路：AImageDecoder（API 30+）
+
+- **动画支持**：支持 GIF、Animated WebP 等多帧格式
+- **API 兼容性**：动态加载以支持低版本 Android 系统
+
+### 回退链路：JNI BitmapFactory（API < 28）
+
+如果 AImageDecoder 不可用或解码失败，库会自动回退至 JNI BitmapFactory。该链路需要宿主在启动时注入 `JavaVM`，否则会出现错误：
 
 `Platform not supported for format: Android JNI fallback decoder unavailable: JavaVM was not initialized...`
-
-### 为什么会这样
-
-- Flutter App 有 `MainActivity` 并不等于 Rust 库一定拿到了 `JavaVM`。
-- 若是通过 Dart FFI 打开动态库，`JNI_OnLoad` 未必自动触发。
-- 未注入 `JavaVM` 时，JNI fallback 无法拿到 `JNIEnv`，从而解码失败。
-
-### 宿主接入要求
-
-1. 在宿主 Rust 库提供并导出 `JNI_OnLoad`，并在其中调用：
-
-```rust
-#[cfg(target_os = "android")]
-#[no_mangle]
-pub extern "system" fn JNI_OnLoad(
-    vm: *mut jni::sys::JavaVM,
-    _reserved: *mut std::ffi::c_void,
-) -> jni::sys::jint {
-    media_compress::init_android_java_vm(vm);
-    jni::sys::JNI_VERSION_1_6
-}
-```
-
-2. 在 Android 启动阶段显式加载 native 库，确保 `JNI_OnLoad` 被调用（示例：`MainActivity` 的 `companion object` 中调用 `System.loadLibrary("rust_lib_app")`）。
 
 ### 排查清单
 
