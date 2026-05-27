@@ -1,15 +1,10 @@
 use std::ffi::{c_char, c_void};
 use std::sync::OnceLock;
 
-use crate::compress::image::orientation::apply_exif_orientation_rgba;
 use crate::compress::image::resize;
 use crate::compress::image::webp_encode;
 use crate::compress::image::{compute_target_dimensions, CompressOptions};
 use crate::error::Error;
-
-fn exif_orientation_from_bytes(data: &[u8]) -> u32 {
-    super::orientation_from_metadata_jni(data)
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Opaque structs (never constructed in Rust — accessed via pointer only)
@@ -168,8 +163,6 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
         }
     };
 
-    let orientation = exif_orientation_from_bytes(input);
-
     unsafe {
         // ── Create decoder ─────────────────────────────────────────────────
         let mut dec: *mut AImageDecoder = std::ptr::null_mut();
@@ -265,7 +258,6 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             }
             // stride may be wider than w*4; slice to exact RGBA rows
             let rgba = compact_rgba(&buf, w, h, stride);
-            let (rgba, w, h) = apply_exif_orientation_rgba(rgba, w, h, orientation);
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
