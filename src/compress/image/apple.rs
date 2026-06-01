@@ -57,6 +57,7 @@ const BITMAP_INFO: u32 = 0x2002;
 const CF_NUMBER_SINT32_TYPE: i32 = 3;
 /// CFNumberType: kCFNumberFloat32Type = 5
 const CF_NUMBER_FLOAT32_TYPE: i32 = 5;
+const DEFAULT_GIF_DELAY_MS: i32 = 100;
 
 // ---------------------------------------------------------------------------
 // FFI — CoreFoundation
@@ -234,13 +235,13 @@ unsafe fn get_frame_orientation(src: CGImageSourceRef, index: usize) -> u32 {
 unsafe fn get_gif_frame_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
     let props = CGImageSourceCopyPropertiesAtIndex(src, index, std::ptr::null());
     if props.is_null() {
-        return 100;
+        return DEFAULT_GIF_DELAY_MS;
     }
 
     let gif_props = CFDictionaryGetValue(props, kCGImagePropertyGIFDictionary as CFTypeRef);
     if gif_props.is_null() {
         CFRelease(props as CFTypeRef);
-        return 100;
+        return DEFAULT_GIF_DELAY_MS;
     }
 
     let delay_ref = CFDictionaryGetValue(
@@ -249,7 +250,7 @@ unsafe fn get_gif_frame_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
     );
     if delay_ref.is_null() {
         CFRelease(props as CFTypeRef);
-        return 100;
+        return DEFAULT_GIF_DELAY_MS;
     }
 
     let mut delay: f32 = 0.1;
@@ -262,17 +263,28 @@ unsafe fn get_gif_frame_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
     CFRelease(props as CFTypeRef);
 
     if ok == 0 {
-        100
+        DEFAULT_GIF_DELAY_MS
     } else {
         ((delay.max(0.01) * 1000.0).round() as i32).max(10)
     }
 }
 
-unsafe fn transcode_gif(
+unsafe fn encode_first_frame_to_jpeg(
+    src: CGImageSourceRef,
+    options: CompressOptions,
+) -> Result<Vec<u8>, Error> {
+    let (pixels, w, h) = decode_frame(src, 0)?;
+    let (target_w, target_h) =
+        compute_target_dimensions(w, h, options.min_width, options.min_height);
+    let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
+    super::turbojpeg_encode::encode_rgba_to_jpeg(&resized, target_w, target_h, options.quality)
+}
+
+unsafe fn collect_resized_gif_frames(
     src: CGImageSourceRef,
     frame_count: usize,
     options: CompressOptions,
-) -> Result<Vec<u8>, Error> {
+) -> Result<(Vec<(Vec<u8>, i32)>, u32, u32), Error> {
     let (first_pixels, src_w, src_h) = decode_frame(src, 0)?;
     let (target_w, target_h) =
         compute_target_dimensions(src_w, src_h, options.min_width, options.min_height);
@@ -291,12 +303,22 @@ unsafe fn transcode_gif(
         ));
     }
 
-    return super::gif_imagequant_encode::encode_gif(
+    Ok((frames, target_w, target_h))
+}
+
+unsafe fn transcode_gif(
+    src: CGImageSourceRef,
+    frame_count: usize,
+    options: CompressOptions,
+) -> Result<Vec<u8>, Error> {
+    let (frames, target_w, target_h) = collect_resized_gif_frames(src, frame_count, options)?;
+
+    super::gif_imagequant_encode::encode_gif(
         &encode::merge_frames_min_delay(frames),
         target_w,
         target_h,
         options.quality,
-    );
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -330,31 +352,11 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
         let result = if matches!(detected, Some(crate::compress::image::ImageFormat::Gif)) {
             transcode_gif(src, count, options)
         } else if count == 1 {
-            // ── Static image ──────────────────────────────────────────────
-            let (pixels, w, h) = decode_frame(src, 0)?;
-            let (target_w, target_h) =
-                compute_target_dimensions(w, h, options.min_width, options.min_height);
-            let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
-            super::turbojpeg_encode::encode_rgba_to_jpeg(
-                &resized,
-                target_w,
-                target_h,
-                options.quality,
-            )
+            // Static image -> JPEG.
+            encode_first_frame_to_jpeg(src, options)
         } else {
-            // ── Animated non-GIF image ─────────────────────────────────────
-            // Export a JPEG poster frame.
-            let (first_pixels, w, h) = decode_frame(src, 0)?;
-            let (target_w, target_h) =
-                compute_target_dimensions(w, h, options.min_width, options.min_height);
-            let first_resized =
-                resize::resize_rgba_nearest(&first_pixels, w, h, target_w, target_h);
-            super::turbojpeg_encode::encode_rgba_to_jpeg(
-                &first_resized,
-                target_w,
-                target_h,
-                options.quality,
-            )
+            // Animated non-GIF -> JPEG poster frame.
+            encode_first_frame_to_jpeg(src, options)
         };
 
         CFRelease(src as CFTypeRef);
