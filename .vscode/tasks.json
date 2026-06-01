@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "git-commit-jpeg-gif-migration",
+			"type": "shell",
+			"command": "git add -A && git commit -m \"replace WebP output with JPEG/GIF pipeline\""
+		}
+	]
+}

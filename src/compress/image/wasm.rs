@@ -9,9 +9,10 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Blob, ImageBitmapRenderingContext, ImageEncodeOptions, OffscreenCanvas};
 
 /// Decode raw image bytes with `createImageBitmap`, draw onto `OffscreenCanvas`,
-/// and re-encode to WebP (or JPEG if the browser lacks WebP encoder support).
+/// and re-encode to JPEG (or GIF for GIF input when browser supports GIF encode).
 async fn canvas_compress(
     input: &[u8],
+    input_is_gif: bool,
     quality: f32,
     min_width: Option<u32>,
     min_height: Option<u32>,
@@ -38,17 +39,16 @@ async fn canvas_compress(
         .dyn_into::<ImageBitmapRenderingContext>()?;
     ctx.transfer_from_image_bitmap(&bitmap);
 
-    // Encode to WebP
-    let mut opts = ImageEncodeOptions::new();
-    opts.type_("image/webp");
-    opts.quality((quality as f64) / 100.0);
-
-    let result = JsFuture::from(canvas.convert_to_blob_with_options(&opts)?).await?;
-    let blob = result.dyn_into::<Blob>()?;
-
-    // Fall back to JPEG if the browser doesn't support WebP encoding (e.g. Safari)
-    let blob = if blob.type_() == "image/webp" {
-        blob
+    let blob = if input_is_gif {
+        let mut gif_opts = ImageEncodeOptions::new();
+        gif_opts.type_("image/gif");
+        let gif_result = JsFuture::from(canvas.convert_to_blob_with_options(&gif_opts)?).await?;
+        let gif_blob = gif_result.dyn_into::<Blob>()?;
+        if gif_blob.type_() == "image/gif" {
+            gif_blob
+        } else {
+            Blob::new_with_u8_array_sequence(&js_sys::Array::of1(&Uint8Array::from(input)))?
+        }
     } else {
         let mut jpeg_opts = ImageEncodeOptions::new();
         jpeg_opts.type_("image/jpeg");
@@ -61,7 +61,7 @@ async fn canvas_compress(
     Ok(Uint8Array::new(&array_buf))
 }
 
-/// Compress raw image bytes to lossy WebP using the browser's Canvas API.
+/// Compress raw image bytes using the browser's Canvas API.
 ///
 /// This is the async, browser-native alternative to `compress_image` on the
 /// WASM/Web platform. Decoding is handled by `createImageBitmap` (supports
@@ -70,7 +70,7 @@ async fn canvas_compress(
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image
-/// * `quality` — WebP lossy quality, 0–100
+/// * `quality` — JPEG quality, 0–100
 /// * `min_width` / `min_height` — optional lower bound for output dimensions.
 ///   The output keeps the original aspect ratio and never upscales.
 ///
@@ -78,7 +78,7 @@ async fn canvas_compress(
 /// ```js
 /// import init, { compress_image_js } from './media_compress.js';
 /// await init();
-/// const webpBytes = await compress_image_js(imageBytes, 75, 1280, 720);
+/// const bytes = await compress_image_js(imageBytes, 75, 1280, 720);
 /// ```
 #[wasm_bindgen]
 pub async fn compress_image_js(
@@ -87,11 +87,12 @@ pub async fn compress_image_js(
     min_width: Option<u32>,
     min_height: Option<u32>,
 ) -> Result<Uint8Array, JsValue> {
-    let may_fallback =
-        ImageFormat::detect(input).map_or(false, |fmt| fmt.should_use_original_if_larger());
+    let detected = ImageFormat::detect(input);
+    let input_is_gif = matches!(detected, Some(ImageFormat::Gif));
+    let may_fallback = detected.map_or(false, |fmt| fmt.should_use_original_if_larger());
 
     let js_bytes = Uint8Array::from(input);
-    let compressed = canvas_compress(input, quality, min_width, min_height).await?;
+    let compressed = canvas_compress(input, input_is_gif, quality, min_width, min_height).await?;
 
     if may_fallback && compressed.length() as usize > input.len() {
         return Ok(js_bytes);

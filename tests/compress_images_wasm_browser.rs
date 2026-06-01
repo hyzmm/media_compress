@@ -3,8 +3,9 @@
 //!
 //! These tests exercise `compress_image_js`, which delegates encoding to the
 //! browser's `createImageBitmap` + `OffscreenCanvas` Canvas API.
-//! On browsers that support WebP encoding (Chrome, Firefox) the output is WebP.
-//! On browsers that do not (Safari), the JS helper falls back to JPEG.
+//! Non-GIF inputs are encoded as JPEG.
+//! GIF input prefers GIF output; when browser GIF encoding is unsupported,
+//! the helper preserves the original GIF bytes.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -19,19 +20,19 @@ static PNG_BYTES: &[u8] = include_bytes!("../test_images/test_image.png");
 static GIF_BYTES: &[u8] = include_bytes!("../test_images/test_image.gif");
 static BMP_BYTES: &[u8] = include_bytes!("../test_images/test_image.bmp");
 
-fn is_webp(bytes: &[u8]) -> bool {
-    bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
-}
-
 fn is_jpeg(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\xff\xd8\xff")
 }
 
+fn is_gif(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
+}
+
 fn detect_format(bytes: &[u8]) -> &'static str {
-    if is_webp(bytes) {
-        "WebP"
-    } else if is_jpeg(bytes) {
-        "JPEG (fallback)"
+    if is_jpeg(bytes) {
+        "JPEG"
+    } else if is_gif(bytes) {
+        "GIF"
     } else {
         "unknown"
     }
@@ -54,43 +55,34 @@ async fn compress_and_log(label: &str, input: &[u8], quality: f32) -> Result<Vec
 }
 
 #[wasm_bindgen_test]
-async fn compress_jpeg_to_webp_or_jpeg() -> Result<(), JsValue> {
+async fn compress_jpeg_to_jpeg() -> Result<(), JsValue> {
     let bytes = compress_and_log("JPEG q=75", JPEG_BYTES, 75.0).await?;
     assert!(
-        is_webp(&bytes) || is_jpeg(&bytes),
-        "output is neither WebP nor JPEG (first 12 bytes: {:?})",
+        is_jpeg(&bytes),
+        "output is not JPEG (first 12 bytes: {:?})",
         &bytes[..12.min(bytes.len())]
     );
     Ok(())
 }
 
 #[wasm_bindgen_test]
-async fn compress_png_to_webp_or_jpeg() -> Result<(), JsValue> {
+async fn compress_png_to_jpeg() -> Result<(), JsValue> {
     let bytes = compress_and_log("PNG  q=75", PNG_BYTES, 75.0).await?;
-    assert!(
-        is_webp(&bytes) || is_jpeg(&bytes),
-        "output is neither WebP nor JPEG"
-    );
+    assert!(is_jpeg(&bytes), "output is not JPEG");
     Ok(())
 }
 
 #[wasm_bindgen_test]
-async fn compress_gif_to_webp_or_jpeg() -> Result<(), JsValue> {
+async fn compress_gif_to_gif() -> Result<(), JsValue> {
     let bytes = compress_and_log("GIF  q=75", GIF_BYTES, 75.0).await?;
-    assert!(
-        is_webp(&bytes) || is_jpeg(&bytes),
-        "output is neither WebP nor JPEG"
-    );
+    assert!(is_gif(&bytes), "output is not GIF");
     Ok(())
 }
 
 #[wasm_bindgen_test]
-async fn compress_bmp_to_webp_or_jpeg() -> Result<(), JsValue> {
+async fn compress_bmp_to_jpeg() -> Result<(), JsValue> {
     let bytes = compress_and_log("BMP  q=75", BMP_BYTES, 75.0).await?;
-    assert!(
-        is_webp(&bytes) || is_jpeg(&bytes),
-        "output is neither WebP nor JPEG"
-    );
+    assert!(is_jpeg(&bytes), "output is not JPEG");
     Ok(())
 }
 

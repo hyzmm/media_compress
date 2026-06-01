@@ -1,6 +1,6 @@
 # media_compress
 
-跨平台图片压缩库（Rust），统一输出为有损 WebP（Web/WASM 在不支持 WebP 编码时回退 JPEG）。
+跨平台图片压缩库（Rust），非 GIF 输入统一输出为有损 JPEG，GIF 输入保持为 GIF。
 
 ## 实现方案
 
@@ -9,10 +9,10 @@
 - 入口 API：`compress_image(input, options)`
 - Web 专用异步 API：`compress_image_js(input, quality, min_width?, min_height?)`
 - 编码目标：
-    - Native 平台：统一编码为 WebP
-    - Web/WASM：优先 WebP，浏览器不支持时回退 JPEG
+    - Native 平台：非 GIF 编码为 JPEG，GIF 重编码为 GIF
+    - Web/WASM：非 GIF 编码为 JPEG，GIF 优先编码为 GIF（不支持时保留原 GIF）
 - 格式识别：通过文件魔数自动检测（JPEG/PNG/GIF/BMP/WebP/TIFF/HEIC）
-- 结果保护：对可能已较优压缩的输入（WebP/JPEG/PNG），若压缩后更大则返回原图字节
+- 结果保护：对可能已较优压缩的输入（WebP/JPEG/PNG/GIF），若压缩后更大则返回原图字节
 
 ### 2. 平台解码与编码路径
 
@@ -22,7 +22,7 @@
 
 - Windows
     - 解码：WIC（Windows Imaging Component）
-    - 动图：读取多帧与元数据延迟，编码为 Animated WebP，支持帧合并与最小延迟优化
+    - 动图：读取多帧与元数据延迟，GIF 输入保持 GIF
 
 - Android
     - 首选：AImageDecoder（动态加载，API 30+）
@@ -31,30 +31,29 @@
 - Web / WASM
     - 解码：`createImageBitmap`
     - 编码：`OffscreenCanvas.convertToBlob`
-    - 输出：优先 `image/webp`，若浏览器不支持则回退 `image/jpeg`
+    - 输出：非 GIF 为 `image/jpeg`；GIF 优先 `image/gif`，不支持时保留原 GIF
     - 注意：WASM 平台应使用异步 `compress_image_js`，同步 `compress_image` 在 WASM 下会返回不支持
 
 ### 3. 压缩策略
 
 - 质量参数：`quality` 取值 0-100（常用 75）
 - 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
-- Native 编码配置：有损 WebP + 多线程
+- Native 编码配置：有损 JPEG（非 GIF）
 - 动图处理：
-    - 保留帧序与延迟
-    - 支持帧合并优化：自动合并指定最小延迟阈值以下的连续帧，减少文件大小
-    - 输出 Animated WebP
+    - GIF 输入：保留帧序与延迟，重编码输出 GIF
+    - 非 GIF 动图输入：导出 JPEG 首帧（poster frame）
 
 ## 各平台图片格式支持情况
 
 说明：下面是“按当前实现链路可达能力”的支持矩阵。浏览器和 Android 厂商实现可能导致个别机型差异。
 
-| 平台                             | 输入格式支持                                                                 | 输出格式                  |
-| -------------------------------- | ---------------------------------------------------------------------------- | ------------------------- |
-| macOS / iOS                      | JPEG, PNG, GIF, BMP, WebP, HEIC, TIFF                                        | WebP                      |
-| Windows                          | JPEG, PNG, GIF, BMP, WebP, TIFF（WIC 能力范围内）                            | WebP                      |
-| Android (API 28+, AImageDecoder) | JPEG, PNG, GIF, BMP, WebP，及设备支持的其他系统解码格式（如部分 HEIF/AVIF）  | WebP                      |
-| Android (API < 28 或回退 JNI)    | JPEG, PNG, GIF, BMP, WebP（HEIC/TIFF 不支持）                                | WebP                      |
-| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器） | WebP（不支持时回退 JPEG） |
+| 平台                             | 输入格式支持                                                                 | 输出格式   |
+| -------------------------------- | ---------------------------------------------------------------------------- | ---------- |
+| macOS / iOS                      | JPEG, PNG, GIF, BMP, WebP, HEIC, TIFF                                        | JPEG / GIF |
+| Windows                          | JPEG, PNG, GIF, BMP, WebP, TIFF（WIC 能力范围内）                            | JPEG / GIF |
+| Android (API 28+, AImageDecoder) | JPEG, PNG, GIF, BMP, WebP，及设备支持的其他系统解码格式（如部分 HEIF/AVIF）  | JPEG / GIF |
+| Android (API < 28 或回退 JNI)    | JPEG, PNG, GIF, BMP, WebP（HEIC/TIFF 不支持）                                | JPEG / GIF |
+| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器） | JPEG / GIF |
 
 ## 大概压缩率数据（样本实测）
 
@@ -127,7 +126,7 @@ let options = CompressOptions {
     min_height: Some(720),
 };
 let out = compress_image(&input, options)?;
-std::fs::write("out.webp", out)?;
+std::fs::write("out.jpg", out)?;
 ```
 
 ### WebAssembly (Browser)
@@ -137,7 +136,7 @@ import init, { compress_image_js } from './pkg/media_compress.js';
 
 await init();
 const out = await compress_image_js(inputBytes, 75, 1280, 720);
-// out 是 Uint8Array，通常为 WebP；Safari 等可能回退为 JPEG
+// out 是 Uint8Array：非 GIF 通常为 JPEG；GIF 输入通常为 GIF
 ```
 
 ## Android 集成与初始化
@@ -146,7 +145,7 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 
 ### 主链路：AImageDecoder（API 30+）
 
-- **动画支持**：支持 GIF、Animated WebP 等多帧格式
+- **动画支持**：支持系统可解码的多帧格式（如 GIF）
 - **API 兼容性**：动态加载以支持低版本 Android 系统
 
 ### 回退链路：JNI BitmapFactory（API < 28）
@@ -173,5 +172,5 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 
 ## 备注
 
-- 本库当前聚焦图片压缩（输出 WebP/JPEG 回退），未包含视频压缩链路。
+- 本库当前聚焦图片压缩（输出 JPEG/GIF），未包含视频压缩链路。
 - 如需更稳定的“业务压缩率基线”，建议在你们真实样本集上固定 `quality` 进行批量评测并记录 P50/P90。

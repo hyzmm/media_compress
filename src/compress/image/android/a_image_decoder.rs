@@ -2,8 +2,7 @@ use std::ffi::{c_char, c_void};
 use std::sync::OnceLock;
 
 use crate::compress::image::resize;
-use crate::compress::image::webp_encode;
-use crate::compress::image::{compute_target_dimensions, CompressOptions};
+use crate::compress::image::{compute_target_dimensions, CompressOptions, ImageFormat};
 use crate::error::Error;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -154,6 +153,10 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
 // ---------------------------------------------------------------------------
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
+    if matches!(ImageFormat::detect(input), Some(ImageFormat::Gif)) {
+        return super::gif_codec::transcode_gif(input, options);
+    }
+
     let api = match api() {
         Some(a) => a,
         None => {
@@ -218,22 +221,9 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
 
         // ── Animated or static? ────────────────────────────────────────────
         // AImageDecoder_isAnimated requires API 31+.
-        // On API 30 (None): GIF is always potentially animated, so reject it
-        // explicitly rather than silently returning only the first frame.
         let animated = match api.AImageDecoder_isAnimated {
             Some(is_anim) => is_anim(dec) != 0,
-            None => {
-                if matches!(
-                    crate::compress::image::ImageFormat::detect(input),
-                    Some(crate::compress::image::ImageFormat::Gif)
-                ) {
-                    (api.AImageDecoder_delete)(dec);
-                    return Err(Error::PlatformNotSupported(
-                        "GIF is not supported on this device (requires API 31+)".into(),
-                    ));
-                }
-                false
-            }
+            None => false,
         };
 
         let result = if !animated {
@@ -261,80 +251,31 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
-            webp_encode::encode_static(&resized, target_w, target_h, options.quality)
+            super::encode_rgba_to_jpeg_jni(&resized, target_w, target_h, options.quality)
         } else {
-            // ── Animated ────────────────────────────────────────────────────
-            // Animation helpers require API 31+; if absent, return error so
-            // the caller can fall back to JNI BitmapFactory (static only).
-            if api.AImageDecoder_advanceFrame.is_none()
-                || api.AImageDecoderFrameInfo_create.is_none()
-                || api.AImageDecoderFrameInfo_getDuration.is_none()
-                || api.AImageDecoderFrameInfo_delete.is_none()
-            {
+            // For non-GIF animations, export a JPEG poster frame.
+            let ret = (api.AImageDecoder_decodeImage)(
+                dec,
+                buf.as_mut_ptr() as *mut c_void,
+                stride,
+                buf_size,
+            );
+            if ret != ANDROID_IMAGE_DECODER_SUCCESS {
                 (api.AImageDecoder_delete)(dec);
-                return Err(Error::PlatformNotSupported(
-                    "AImageDecoder animation functions not available on this device".into(),
-                ));
-            }
-            let advance_frame = api.AImageDecoder_advanceFrame.unwrap();
-            let frame_info_create = api.AImageDecoderFrameInfo_create.unwrap();
-            let frame_info_gd = api.AImageDecoderFrameInfo_getDuration.unwrap();
-            let frame_info_delete = api.AImageDecoderFrameInfo_delete.unwrap();
-
-            let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::new();
-            let mut is_first = true;
-
-            loop {
-                let ret = (api.AImageDecoder_decodeImage)(
-                    dec,
-                    buf.as_mut_ptr() as *mut c_void,
-                    stride,
-                    buf_size,
-                );
-                if ret != ANDROID_IMAGE_DECODER_SUCCESS {
-                    if is_first {
-                        (api.AImageDecoder_delete)(dec);
-                        if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
-                            return Err(Error::PlatformNotSupported(
-                                "format not supported by AImageDecoder on this device".into(),
-                            ));
-                        }
-                        return Err(Error::DecodeError(format!(
-                            "AImageDecoder_decodeImage failed on frame 0: {}",
-                            ret
-                        )));
-                    }
-                    break;
+                if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
+                    return Err(Error::PlatformNotSupported(
+                        "format not supported by AImageDecoder on this device".into(),
+                    ));
                 }
-                is_first = false;
-
-                let rgba = compact_rgba(&buf, w, h, stride);
-                let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
-
-                // Read frame duration before advancing
-                let fi = frame_info_create(dec);
-                let delay_ms = if fi.is_null() {
-                    DEFAULT_DELAY_MS
-                } else {
-                    let ns = frame_info_gd(fi);
-                    frame_info_delete(fi);
-                    ((ns / 1_000_000) as i32).max(10)
-                };
-
-                frame_data.push((resized, delay_ms));
-
-                let adv = advance_frame(dec);
-                if adv != ANDROID_IMAGE_DECODER_SUCCESS {
-                    break;
-                }
+                return Err(Error::DecodeError(format!(
+                    "AImageDecoder_decodeImage failed on poster frame: {}",
+                    ret
+                )));
             }
 
-            webp_encode::encode_animated(
-                &webp_encode::merge_frames_min_delay(frame_data),
-                target_w,
-                target_h,
-                options.quality,
-            )
+            let rgba = compact_rgba(&buf, w, h, stride);
+            let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
+            super::encode_rgba_to_jpeg_jni(&resized, target_w, target_h, options.quality)
         };
 
         (api.AImageDecoder_delete)(dec);
@@ -342,7 +283,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
     }
 }
 
-/// When `stride > w * 4`, compact rows so that `webp::Encoder` receives
+/// When `stride > w * 4`, compact rows so that encoders receive
 /// tightly-packed RGBA without padding bytes.
 fn compact_rgba(buf: &[u8], w: u32, h: u32, stride: usize) -> Vec<u8> {
     let row_bytes = w as usize * 4;

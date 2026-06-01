@@ -1,8 +1,8 @@
 use std::ffi::c_void;
 
-use super::{compute_target_dimensions, resize, CompressOptions};
+use super::encode;
 use super::orientation::apply_exif_orientation_rgba;
-use super::webp_encode;
+use super::{compute_target_dimensions, resize, CompressOptions, ImageFormat};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -27,8 +27,6 @@ const WIC_DECODE_METADATA_CACHE_ON_LOAD: u32 = 0;
 const WIC_BITMAP_DITHER_TYPE_NONE: u32 = 0;
 /// WICBitmapPaletteType: WICBitmapPaletteTypeCustom = 0
 const WIC_BITMAP_PALETTE_TYPE_CUSTOM: u32 = 0;
-
-const DEFAULT_DELAY_MS: i32 = 100;
 
 // ---------------------------------------------------------------------------
 // GUID / IID
@@ -186,6 +184,7 @@ extern "system" {
 // 3=CreateDecoderFromFilename, 4=CreateDecoderFromStream, 5=CreateDecoderFromFileHandle,
 // 6=CreateComponentInfo, 7=CreateDecoder, 8=CreateEncoder, 9=CreatePalette, 10=CreateFormatConverter
 const WIC_FACTORY_CREATE_DECODER_FROM_STREAM: usize = 4;
+const WIC_FACTORY_CREATE_ENCODER: usize = 8;
 const WIC_FACTORY_CREATE_FORMAT_CONVERTER: usize = 10;
 
 // IWICBitmapDecoder (inherits IUnknown):
@@ -216,8 +215,47 @@ const WIC_METADATA_GET_BY_NAME: usize = 5;
 const ISTREAM_WRITE: usize = 4;
 const ISTREAM_SEEK: usize = 5;
 
+// IWICBitmapEncoder (inherits IUnknown):
+// 3=Initialize, 4=GetContainerFormat, 5=GetEncoderInfo, 6=SetColorContexts,
+// 7=SetPalette, 8=SetThumbnail, 9=SetPreview, 10=CreateNewFrame, 11=Commit, 12=GetMetadataQueryWriter
+const WIC_BITMAP_ENCODER_INITIALIZE: usize = 3;
+const WIC_BITMAP_ENCODER_CREATE_NEW_FRAME: usize = 10;
+const WIC_BITMAP_ENCODER_COMMIT: usize = 11;
+
+// IWICBitmapFrameEncode (inherits IUnknown):
+// 3=Initialize, 4=SetSize, 5=SetResolution, 6=SetPixelFormat, 7=SetColorContexts,
+// 8=SetPalette, 9=SetThumbnail, 10=WritePixels, 11=WriteSource, 12=Commit, 13=GetMetadataQueryWriter
+const WIC_BITMAP_FRAME_ENCODE_INITIALIZE: usize = 3;
+const WIC_BITMAP_FRAME_ENCODE_SET_SIZE: usize = 4;
+const WIC_BITMAP_FRAME_ENCODE_SET_PIXEL_FORMAT: usize = 6;
+const WIC_BITMAP_FRAME_ENCODE_WRITE_PIXELS: usize = 10;
+const WIC_BITMAP_FRAME_ENCODE_COMMIT: usize = 12;
+const WIC_BITMAP_FRAME_ENCODE_GET_METADATA_QUERY_WRITER: usize = 13;
+
+// IWICMetadataQueryWriter extends IWICMetadataQueryReader.
+const WIC_METADATA_SET_BY_NAME: usize = 7;
+
+// WICBitmapEncoderCacheOption: WICBitmapEncoderNoCache = 2
+const WIC_BITMAP_ENCODER_NO_CACHE: u32 = 2;
+
 // STREAM_SEEK_SET = 0
 const STREAM_SEEK_SET: u32 = 0;
+
+/// GUID_ContainerFormatJpeg {19e4a5aa-5662-4fc5-a0c0-1758028e1057}
+const GUID_CONTAINER_FORMAT_JPEG: GUID = GUID {
+    data1: 0x19e4a5aa,
+    data2: 0x5662,
+    data3: 0x4fc5,
+    data4: [0xa0, 0xc0, 0x17, 0x58, 0x02, 0x8e, 0x10, 0x57],
+};
+
+/// GUID_ContainerFormatGif {1f8a5601-7d4d-4cbd-9c82-1bc8d4eeb9a5}
+const GUID_CONTAINER_FORMAT_GIF: GUID = GUID {
+    data1: 0x1f8a5601,
+    data2: 0x7d4d,
+    data3: 0x4cbd,
+    data4: [0x9c, 0x82, 0x1b, 0xc8, 0xd4, 0xee, 0xb9, 0xa5],
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -273,6 +311,482 @@ unsafe fn make_mem_stream(data: &[u8]) -> Result<*mut c_void, Error> {
     Ok(stream)
 }
 
+unsafe fn empty_mem_stream() -> Result<*mut c_void, Error> {
+    let mut stream: *mut c_void = std::ptr::null_mut();
+    let hr = CreateStreamOnHGlobal(std::ptr::null_mut(), 1, &mut stream);
+    if hr != S_OK || stream.is_null() {
+        return Err(Error::EncodeError(format!(
+            "CreateStreamOnHGlobal failed: 0x{:08x}",
+            hr
+        )));
+    }
+    Ok(stream)
+}
+
+unsafe fn stream_to_vec(stream: *mut c_void) -> Result<Vec<u8>, Error> {
+    let hr: HRESULT = com_call!(
+        stream,
+        ISTREAM_SEEK,
+        unsafe extern "system" fn(*mut c_void, i64, u32, *mut u64) -> HRESULT,
+        0i64,
+        STREAM_SEEK_SET,
+        std::ptr::null_mut::<u64>()
+    );
+    if hr != S_OK {
+        return Err(Error::EncodeError(format!(
+            "IStream::Seek failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    // Pull bytes in chunks via ISequentialStream::Read slot.
+    let mut out = Vec::new();
+    loop {
+        let mut buf = [0u8; 8192];
+        let mut read: u32 = 0;
+        let hr: HRESULT = com_call!(
+            stream,
+            3usize,
+            unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32) -> HRESULT,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut read
+        );
+        if hr != S_OK {
+            return Err(Error::EncodeError(format!(
+                "ISequentialStream::Read failed: 0x{:08x}",
+                hr
+            )));
+        }
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..read as usize]);
+    }
+    Ok(out)
+}
+
+unsafe fn encode_jpeg_wic(
+    factory: *mut c_void,
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>, Error> {
+    if w == 0 || h == 0 {
+        return Err(Error::EncodeError("invalid image dimensions".into()));
+    }
+    let expected = w as usize * h as usize * 4;
+    if rgba.len() != expected {
+        return Err(Error::EncodeError(format!(
+            "invalid RGBA length: got {}, expected {}",
+            rgba.len(),
+            expected
+        )));
+    }
+
+    // WIC JPEG encoder expects BGR/BGRA semantics; convert RGBA -> BGRA first.
+    let mut bgra = rgba.to_vec();
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+
+    let stream = empty_mem_stream()?;
+
+    let mut encoder: *mut c_void = std::ptr::null_mut();
+    let hr: HRESULT = com_call!(
+        factory,
+        WIC_FACTORY_CREATE_ENCODER,
+        unsafe extern "system" fn(
+            *mut c_void,
+            *const GUID,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> HRESULT,
+        &GUID_CONTAINER_FORMAT_JPEG as *const GUID,
+        std::ptr::null::<GUID>(),
+        &mut encoder
+    );
+    if hr != S_OK || encoder.is_null() {
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICImagingFactory::CreateEncoder(JPEG) failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let hr: HRESULT = com_call!(
+        encoder,
+        WIC_BITMAP_ENCODER_INITIALIZE,
+        unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> HRESULT,
+        stream,
+        WIC_BITMAP_ENCODER_NO_CACHE
+    );
+    if hr != S_OK {
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapEncoder::Initialize failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let mut frame: *mut c_void = std::ptr::null_mut();
+    let hr: HRESULT = com_call!(
+        encoder,
+        WIC_BITMAP_ENCODER_CREATE_NEW_FRAME,
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT,
+        &mut frame,
+        std::ptr::null_mut::<*mut c_void>()
+    );
+    if hr != S_OK || frame.is_null() {
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapEncoder::CreateNewFrame failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let hr: HRESULT = com_call!(
+        frame,
+        WIC_BITMAP_FRAME_ENCODE_INITIALIZE,
+        unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        std::ptr::null_mut::<c_void>()
+    );
+    if hr != S_OK {
+        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapFrameEncode::Initialize failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let hr: HRESULT = com_call!(
+        frame,
+        WIC_BITMAP_FRAME_ENCODE_SET_SIZE,
+        unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT,
+        w,
+        h
+    );
+    if hr != S_OK {
+        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapFrameEncode::SetSize failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let mut pixel_fmt = GUID_WIC_PIXEL_FORMAT_32BPP_BGRA;
+    let hr: HRESULT = com_call!(
+        frame,
+        WIC_BITMAP_FRAME_ENCODE_SET_PIXEL_FORMAT,
+        unsafe extern "system" fn(*mut c_void, *mut GUID) -> HRESULT,
+        &mut pixel_fmt as *mut GUID
+    );
+    if hr != S_OK {
+        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapFrameEncode::SetPixelFormat failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let stride = w * 4;
+    let hr: HRESULT = com_call!(
+        frame,
+        WIC_BITMAP_FRAME_ENCODE_WRITE_PIXELS,
+        unsafe extern "system" fn(*mut c_void, u32, u32, u32, *const u8) -> HRESULT,
+        h,
+        stride,
+        bgra.len() as u32,
+        bgra.as_ptr()
+    );
+    if hr != S_OK {
+        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapFrameEncode::WritePixels failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let hr: HRESULT = com_call!(
+        frame,
+        WIC_BITMAP_FRAME_ENCODE_COMMIT,
+        unsafe extern "system" fn(*mut c_void) -> HRESULT
+    );
+    if hr != S_OK {
+        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapFrameEncode::Commit failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let hr: HRESULT = com_call!(
+        encoder,
+        WIC_BITMAP_ENCODER_COMMIT,
+        unsafe extern "system" fn(*mut c_void) -> HRESULT
+    );
+    if hr != S_OK {
+        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapEncoder::Commit failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+    com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+
+    let out = stream_to_vec(stream);
+    com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+    out
+}
+
+unsafe fn set_gif_frame_delay(frame: *mut c_void, delay_ms: i32) {
+    let mut writer: *mut c_void = std::ptr::null_mut();
+    let hr: HRESULT = com_call!(
+        frame,
+        WIC_BITMAP_FRAME_ENCODE_GET_METADATA_QUERY_WRITER,
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        &mut writer
+    );
+    if hr != S_OK || writer.is_null() {
+        return;
+    }
+
+    let delay_cs = (delay_ms.max(10) / 10).min(u16::MAX as i32) as u16;
+    let value = PROPVARIANT {
+        vt: VT_UI2,
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+        val: PropVariantVal { ui_val: delay_cs },
+    };
+    let path: Vec<u16> = "/grctlext/Delay\0".encode_utf16().collect();
+    let _ = com_call!(
+        writer,
+        WIC_METADATA_SET_BY_NAME,
+        unsafe extern "system" fn(*mut c_void, *const u16, *const PROPVARIANT) -> HRESULT,
+        path.as_ptr(),
+        &value as *const PROPVARIANT
+    );
+    com_call!(writer, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+}
+
+unsafe fn encode_animated_gif_wic(
+    factory: *mut c_void,
+    frames: &[(Vec<u8>, i32)],
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>, Error> {
+    if frames.is_empty() {
+        return Err(Error::EncodeError(
+            "cannot encode GIF with zero frames".into(),
+        ));
+    }
+
+    let stream = empty_mem_stream()?;
+
+    let mut encoder: *mut c_void = std::ptr::null_mut();
+    let hr: HRESULT = com_call!(
+        factory,
+        WIC_FACTORY_CREATE_ENCODER,
+        unsafe extern "system" fn(
+            *mut c_void,
+            *const GUID,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> HRESULT,
+        &GUID_CONTAINER_FORMAT_GIF as *const GUID,
+        std::ptr::null::<GUID>(),
+        &mut encoder
+    );
+    if hr != S_OK || encoder.is_null() {
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICImagingFactory::CreateEncoder(GIF) failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    let hr: HRESULT = com_call!(
+        encoder,
+        WIC_BITMAP_ENCODER_INITIALIZE,
+        unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> HRESULT,
+        stream,
+        WIC_BITMAP_ENCODER_NO_CACHE
+    );
+    if hr != S_OK {
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapEncoder::Initialize(GIF) failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    for (pixels, delay_ms) in frames {
+        let mut frame: *mut c_void = std::ptr::null_mut();
+        let mut property_bag: *mut c_void = std::ptr::null_mut();
+        let hr: HRESULT = com_call!(
+            encoder,
+            WIC_BITMAP_ENCODER_CREATE_NEW_FRAME,
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT,
+            &mut frame,
+            &mut property_bag
+        );
+        if hr != S_OK || frame.is_null() {
+            if !property_bag.is_null() {
+                com_call!(
+                    property_bag,
+                    2,
+                    unsafe extern "system" fn(*mut c_void) -> u32
+                );
+            }
+            com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            return Err(Error::EncodeError(format!(
+                "IWICBitmapEncoder::CreateNewFrame(GIF) failed: 0x{:08x}",
+                hr
+            )));
+        }
+
+        let hr: HRESULT = com_call!(
+            frame,
+            WIC_BITMAP_FRAME_ENCODE_INITIALIZE,
+            unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+            property_bag
+        );
+        if !property_bag.is_null() {
+            com_call!(
+                property_bag,
+                2,
+                unsafe extern "system" fn(*mut c_void) -> u32
+            );
+        }
+        if hr != S_OK {
+            com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            return Err(Error::EncodeError(format!(
+                "IWICBitmapFrameEncode::Initialize(GIF) failed: 0x{:08x}",
+                hr
+            )));
+        }
+
+        let hr: HRESULT = com_call!(
+            frame,
+            WIC_BITMAP_FRAME_ENCODE_SET_SIZE,
+            unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT,
+            w,
+            h
+        );
+        if hr != S_OK {
+            com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            return Err(Error::EncodeError(format!(
+                "IWICBitmapFrameEncode::SetSize(GIF) failed: 0x{:08x}",
+                hr
+            )));
+        }
+
+        let mut pixel_fmt = GUID_WIC_PIXEL_FORMAT_32BPP_BGRA;
+        let hr: HRESULT = com_call!(
+            frame,
+            WIC_BITMAP_FRAME_ENCODE_SET_PIXEL_FORMAT,
+            unsafe extern "system" fn(*mut c_void, *mut GUID) -> HRESULT,
+            &mut pixel_fmt as *mut GUID
+        );
+        if hr != S_OK {
+            com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            return Err(Error::EncodeError(format!(
+                "IWICBitmapFrameEncode::SetPixelFormat(GIF) failed: 0x{:08x}",
+                hr
+            )));
+        }
+
+        let mut bgra = pixels.clone();
+        for px in bgra.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+
+        let stride = w * 4;
+        let hr: HRESULT = com_call!(
+            frame,
+            WIC_BITMAP_FRAME_ENCODE_WRITE_PIXELS,
+            unsafe extern "system" fn(*mut c_void, u32, u32, u32, *const u8) -> HRESULT,
+            h,
+            stride,
+            bgra.len() as u32,
+            bgra.as_ptr()
+        );
+        if hr != S_OK {
+            com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            return Err(Error::EncodeError(format!(
+                "IWICBitmapFrameEncode::WritePixels(GIF) failed: 0x{:08x}",
+                hr
+            )));
+        }
+
+        set_gif_frame_delay(frame, *delay_ms);
+
+        let hr: HRESULT = com_call!(
+            frame,
+            WIC_BITMAP_FRAME_ENCODE_COMMIT,
+            unsafe extern "system" fn(*mut c_void) -> HRESULT
+        );
+        if hr != S_OK {
+            com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+            return Err(Error::EncodeError(format!(
+                "IWICBitmapFrameEncode::Commit(GIF) failed: 0x{:08x}",
+                hr
+            )));
+        }
+
+        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+    }
+
+    let hr: HRESULT = com_call!(
+        encoder,
+        WIC_BITMAP_ENCODER_COMMIT,
+        unsafe extern "system" fn(*mut c_void) -> HRESULT
+    );
+    if hr != S_OK {
+        com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        return Err(Error::EncodeError(format!(
+            "IWICBitmapEncoder::Commit(GIF) failed: 0x{:08x}",
+            hr
+        )));
+    }
+
+    com_call!(encoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+
+    let out = stream_to_vec(stream);
+    com_call!(stream, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+    out
+}
+
 /// Read one frame's RGBA pixels via a WIC format converter.
 unsafe fn decode_wic_frame(
     factory: *mut c_void,
@@ -311,7 +825,7 @@ unsafe fn decode_wic_frame(
     }
 
     // Initialize converter: source → 32bppBGRA first (universally supported),
-    // then swap R↔B to produce RGBA for the WebP encoder.
+    // then swap R↔B to produce RGBA.
     let hr: HRESULT = com_call!(
         converter,
         WIC_FORMAT_CONVERTER_INITIALIZE,
@@ -376,45 +890,6 @@ unsafe fn decode_wic_frame(
     Ok((pixels, w, h))
 }
 
-/// Read GIF frame delay via metadata query "/grctlext/Delay" (unit: 1/100 s).
-/// Returns milliseconds; falls back to `DEFAULT_DELAY_MS` on any failure.
-unsafe fn get_gif_delay_ms(frame: *mut c_void) -> i32 {
-    let mut mqr: *mut c_void = std::ptr::null_mut();
-    let hr: HRESULT = com_call!(
-        frame,
-        WIC_FRAME_GET_METADATA_QUERY_READER,
-        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
-        &mut mqr
-    );
-    if hr != S_OK || mqr.is_null() {
-        return DEFAULT_DELAY_MS;
-    }
-
-    // Build a PROPVARIANT to receive the result
-    let mut pv = PROPVARIANT::zero();
-
-    // Path: "/grctlext/Delay" as a null-terminated wide string
-    let path_wide: Vec<u16> = "/grctlext/Delay\0".encode_utf16().collect();
-
-    let hr: HRESULT = com_call!(
-        mqr,
-        WIC_METADATA_GET_BY_NAME,
-        unsafe extern "system" fn(*mut c_void, *const u16, *mut PROPVARIANT) -> HRESULT,
-        path_wide.as_ptr(),
-        &mut pv
-    );
-
-    com_call!(mqr, 2, unsafe extern "system" fn(*mut c_void) -> u32); // Release MQR
-
-    if hr != S_OK || pv.vt != VT_UI2 {
-        return DEFAULT_DELAY_MS;
-    }
-
-    // Delay is in units of 1/100 second → convert to ms
-    let hundredths = pv.val.ui_val as i32;
-    (hundredths * 10).max(10)
-}
-
 /// Read image orientation via WIC metadata query reader.
 /// Returns EXIF orientation in 1..=8, or 1 when not present.
 unsafe fn get_frame_orientation(frame: *mut c_void) -> u32 {
@@ -467,12 +942,83 @@ unsafe fn query_orientation_from_path(mqr: *mut c_void, path: &str) -> Option<u3
     }
 }
 
+unsafe fn get_gif_frame_delay_ms(frame: *mut c_void) -> i32 {
+    let mut mqr: *mut c_void = std::ptr::null_mut();
+    let hr: HRESULT = com_call!(
+        frame,
+        WIC_FRAME_GET_METADATA_QUERY_READER,
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        &mut mqr
+    );
+    if hr != S_OK || mqr.is_null() {
+        return 100;
+    }
+
+    let delay_ms = query_orientation_from_path(mqr, "/grctlext/Delay\0")
+        .map(|delay_cs| (delay_cs.max(1) as i32) * 10)
+        .unwrap_or(100);
+
+    com_call!(mqr, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+    delay_ms
+}
+
+unsafe fn transcode_gif_wic(
+    factory: *mut c_void,
+    decoder: *mut c_void,
+    frame_count: u32,
+    options: CompressOptions,
+) -> Result<Vec<u8>, Error> {
+    let mut frames = Vec::with_capacity(frame_count as usize);
+    let mut target_w = 0;
+    let mut target_h = 0;
+
+    for index in 0..frame_count {
+        let mut frame: *mut c_void = std::ptr::null_mut();
+        let hr: HRESULT = com_call!(
+            decoder,
+            WIC_DECODER_GET_FRAME,
+            unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
+            index,
+            &mut frame
+        );
+        if hr != S_OK || frame.is_null() {
+            return Err(Error::DecodeError(format!(
+                "IWICBitmapDecoder::GetFrame({}) failed for GIF: 0x{:08x}",
+                index, hr
+            )));
+        }
+
+        let delay_ms = get_gif_frame_delay_ms(frame);
+        let decoded = decode_wic_frame(factory, frame);
+        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
+        let (pixels, w, h) = decoded?;
+
+        if index == 0 {
+            (target_w, target_h) =
+                compute_target_dimensions(w, h, options.min_width, options.min_height);
+        }
+
+        frames.push((
+            resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h),
+            delay_ms,
+        ));
+    }
+
+    encode_animated_gif_wic(
+        factory,
+        &encode::merge_frames_min_delay(frames),
+        target_w,
+        target_h,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     unsafe {
+        let detected = ImageFormat::detect(input);
         // Initialize COM in apartment-threaded mode (idempotent for same thread)
         CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
 
@@ -550,7 +1096,9 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             ));
         }
 
-        let result = if frame_count == 1 {
+        let result = if matches!(detected, Some(ImageFormat::Gif)) {
+            transcode_gif_wic(factory, decoder, frame_count, options)
+        } else if frame_count == 1 {
             // ── Static image ────────────────────────────────────────────────
             let mut frame: *mut c_void = std::ptr::null_mut();
             let hr: HRESULT = com_call!(
@@ -577,11 +1125,10 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
-
-            webp_encode::encode_static(&resized, target_w, target_h, options.quality)
+            encode_jpeg_wic(factory, &resized, target_w, target_h)
         } else {
-            // ── Animated (GIF, APNG, …) ─────────────────────────────────────
-            // Get first frame to determine dimensions
+            // ── Animated non-GIF image ─────────────────────────────────────
+            // Export a JPEG poster frame from the first decoded frame.
             let mut frame0: *mut c_void = std::ptr::null_mut();
             let hr: HRESULT = com_call!(
                 decoder,
@@ -598,41 +1145,13 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
                 ));
             }
 
-            let delay0 = get_gif_delay_ms(frame0);
             let r0 = decode_wic_frame(factory, frame0);
             com_call!(frame0, 2, unsafe extern "system" fn(*mut c_void) -> u32);
             let (pixels0, w, h) = r0?;
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
-
-            // Collect all frame pixel data first so that every Vec<u8> lives
-            // long enough for AnimEncoder (which borrows each slice).
-            let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::with_capacity(frame_count as usize);
-            let first_resized = resize::resize_rgba_nearest(&pixels0, w, h, target_w, target_h);
-            frame_data.push((first_resized, delay0));
-
-            for i in 1..frame_count {
-                let mut frame: *mut c_void = std::ptr::null_mut();
-                let hr: HRESULT = com_call!(
-                    decoder,
-                    WIC_DECODER_GET_FRAME,
-                    unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
-                    i,
-                    &mut frame
-                );
-                if hr != S_OK || frame.is_null() {
-                    break; // best-effort: stop at first failure
-                }
-
-                let delay = get_gif_delay_ms(frame);
-                let r = decode_wic_frame(factory, frame);
-                com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
-                let (pixels, _, _) = r?;
-                let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
-                frame_data.push((resized, delay));
-            }
-
-            webp_encode::encode_animated(&webp_encode::merge_frames_min_delay(frame_data), target_w, target_h, options.quality)
+            let resized = resize::resize_rgba_nearest(&pixels0, w, h, target_w, target_h);
+            encode_jpeg_wic(factory, &resized, target_w, target_h)
         };
 
         com_call!(decoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);

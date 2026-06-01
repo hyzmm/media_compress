@@ -1,8 +1,8 @@
 use crate::error::Error;
 
-// Shared WebP encoding helpers (not needed on WASM which has no webp dependency)
+// Shared native encoding/transcoding helpers (not needed on WASM).
 #[cfg(not(target_arch = "wasm32"))]
-mod webp_encode;
+mod encode;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod orientation;
@@ -71,10 +71,10 @@ impl ImageFormat {
     }
 
     /// Returns `true` if the format is one that may already be well-compressed
-    /// (WebP, JPEG, or PNG), meaning we should keep the original when the
+    /// (WebP, JPEG, PNG, or GIF), meaning we should keep the original when the
     /// compressed output turns out to be larger.
     pub fn should_use_original_if_larger(&self) -> bool {
-        matches!(self, Self::Webp | Self::Jpeg | Self::Png)
+        matches!(self, Self::Webp | Self::Jpeg | Self::Png | Self::Gif)
     }
 }
 
@@ -133,12 +133,12 @@ pub(crate) fn compute_target_dimensions(
     (dst_w, dst_h)
 }
 
-/// Compress an image to lossy WebP.
+/// Compress an image to JPEG, while keeping GIF input as GIF.
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image (any supported format)
 /// * `options` — compression options:
-///   - `quality`: WebP lossy quality, 0–100
+///   - `quality`: JPEG quality, 0–100
 ///   - `min_width` / `min_height`: optional lower bound for output size.
 ///     Compression may downscale while preserving aspect ratio, but will not
 ///     upscale when the source image is already smaller.
@@ -148,7 +148,7 @@ pub(crate) fn compute_target_dimensions(
 /// |----------|-------------------------------------------|
 /// | macOS / iOS | JPEG, PNG, GIF, BMP, HEIC, TIFF, WebP |
 /// | Android (API 24+) | JPEG, PNG, GIF, BMP, WebP, TIFF |
-/// | Windows  | JPEG, PNG, GIF, BMP, TIFF, WebP           |
+/// | Windows  | JPEG, PNG, GIF, BMP, TIFF, WebP          |
 /// | Web/WASM | not supported (decode on the JS side)     |
 pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     // Validate or detect format (used only for error messages if the platform
