@@ -12,16 +12,13 @@ use crate::error::Error;
 type CFTypeRef = *const c_void;
 type CFAllocatorRef = *const c_void;
 type CFDataRef = *const c_void;
-type CFMutableDataRef = *mut c_void;
 type CFDictionaryRef = *const c_void;
-type CFMutableDictionaryRef = *mut c_void;
 type CFStringRef = *const c_void;
 type CFNumberRef = *const c_void;
 type CGImageRef = *mut c_void;
 type CGContextRef = *mut c_void;
 type CGColorSpaceRef = *mut c_void;
 type CGImageSourceRef = *mut c_void;
-type CGImageDestinationRef = *mut c_void;
 
 type CFIndex = isize;
 
@@ -68,29 +65,10 @@ const CF_NUMBER_FLOAT32_TYPE: i32 = 5;
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
-    fn CFDataCreateMutable(allocator: CFAllocatorRef, capacity: CFIndex) -> CFMutableDataRef;
-    fn CFDataGetLength(the_data: CFDataRef) -> CFIndex;
-    fn CFDataGetBytePtr(the_data: CFDataRef) -> *const u8;
 
     fn CFRelease(cf: CFTypeRef);
 
     fn CFDictionaryGetValue(dict: CFDictionaryRef, key: CFTypeRef) -> *const c_void;
-    fn CFDictionaryCreateMutable(
-        allocator: CFAllocatorRef,
-        capacity: CFIndex,
-        key_callbacks: *const c_void,
-        value_callbacks: *const c_void,
-    ) -> CFMutableDictionaryRef;
-    fn CFDictionarySetValue(
-        the_dict: CFMutableDictionaryRef,
-        key: *const c_void,
-        value: *const c_void,
-    );
-    fn CFNumberCreate(
-        allocator: CFAllocatorRef,
-        the_type: i32,
-        value_ptr: *const c_void,
-    ) -> CFNumberRef;
 
     fn CFNumberGetValue(number: CFNumberRef, the_type: i32, value_ptr: *mut c_void) -> u8;
 }
@@ -117,36 +95,9 @@ extern "C" {
         options: CFDictionaryRef,
     ) -> CFDictionaryRef;
 
-    fn CGImageDestinationCreateWithData(
-        data: CFMutableDataRef,
-        ty: CFStringRef,
-        count: usize,
-        options: CFDictionaryRef,
-    ) -> CGImageDestinationRef;
-    fn CGImageDestinationAddImage(
-        idst: CGImageDestinationRef,
-        image: CGImageRef,
-        properties: CFDictionaryRef,
-    );
-    fn CGImageDestinationSetProperties(idst: CGImageDestinationRef, properties: CFDictionaryRef);
-    fn CGImageDestinationFinalize(idst: CGImageDestinationRef) -> u8;
-
     static kCGImagePropertyOrientation: CFStringRef;
     static kCGImagePropertyGIFDictionary: CFStringRef;
     static kCGImagePropertyGIFDelayTime: CFStringRef;
-    static kCGImagePropertyGIFLoopCount: CFStringRef;
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreServices", kind = "framework")]
-extern "C" {
-    static kUTTypeGIF: CFStringRef;
-}
-
-#[cfg(target_os = "ios")]
-#[link(name = "MobileCoreServices", kind = "framework")]
-extern "C" {
-    static kUTTypeGIF: CFStringRef;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,8 +122,6 @@ extern "C" {
         space: CGColorSpaceRef,
         bitmap_info: u32,
     ) -> CGContextRef;
-
-    fn CGBitmapContextCreateImage(ctx: CGContextRef) -> CGImageRef;
 
     fn CGContextRelease(ctx: CGContextRef);
     fn CGContextDrawImage(ctx: CGContextRef, rect: CGRect, image: CGImageRef);
@@ -282,43 +231,6 @@ unsafe fn get_frame_orientation(src: CGImageSourceRef, index: usize) -> u32 {
     }
 }
 
-unsafe fn make_cgimage_from_rgba(pixels: &[u8], w: u32, h: u32) -> Result<CGImageRef, Error> {
-    let mut bgra = pixels.to_vec();
-    for chunk in bgra.chunks_exact_mut(4) {
-        chunk.swap(0, 2);
-    }
-
-    let cs = CGColorSpaceCreateDeviceRGB();
-    let bytes_per_row = w as usize * 4;
-    let ctx = CGBitmapContextCreate(
-        bgra.as_mut_ptr() as *mut c_void,
-        w as usize,
-        h as usize,
-        8,
-        bytes_per_row,
-        cs,
-        BITMAP_INFO,
-    );
-    if ctx.is_null() {
-        CGColorSpaceRelease(cs);
-        return Err(Error::EncodeError(
-            "CGBitmapContextCreate failed while encoding JPEG".into(),
-        ));
-    }
-
-    let image = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
-    CGColorSpaceRelease(cs);
-
-    if image.is_null() {
-        return Err(Error::EncodeError(
-            "CGBitmapContextCreateImage failed while encoding JPEG".into(),
-        ));
-    }
-
-    Ok(image)
-}
-
 unsafe fn get_gif_frame_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
     let props = CGImageSourceCopyPropertiesAtIndex(src, index, std::ptr::null());
     if props.is_null() {
@@ -356,167 +268,6 @@ unsafe fn get_gif_frame_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
     }
 }
 
-unsafe fn encode_animated_gif(frames: &[(Vec<u8>, i32)], w: u32, h: u32) -> Result<Vec<u8>, Error> {
-    if frames.is_empty() {
-        return Err(Error::EncodeError(
-            "cannot encode GIF with zero frames".into(),
-        ));
-    }
-
-    let out_data = CFDataCreateMutable(std::ptr::null(), 0);
-    if out_data.is_null() {
-        return Err(Error::EncodeError(
-            "CFDataCreateMutable returned null".into(),
-        ));
-    }
-
-    let dest =
-        CGImageDestinationCreateWithData(out_data, kUTTypeGIF, frames.len(), std::ptr::null());
-    if dest.is_null() {
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CGImageDestinationCreateWithData failed for GIF".into(),
-        ));
-    }
-
-    let loop_count: i32 = 0;
-    let loop_count_ref = CFNumberCreate(
-        std::ptr::null(),
-        CF_NUMBER_SINT32_TYPE,
-        &loop_count as *const i32 as *const c_void,
-    );
-    if loop_count_ref.is_null() {
-        CFRelease(dest as CFTypeRef);
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CFNumberCreate failed for GIF loop count".into(),
-        ));
-    }
-
-    let gif_dict =
-        CFDictionaryCreateMutable(std::ptr::null(), 1, std::ptr::null(), std::ptr::null());
-    if gif_dict.is_null() {
-        CFRelease(loop_count_ref as CFTypeRef);
-        CFRelease(dest as CFTypeRef);
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CFDictionaryCreateMutable failed for GIF container properties".into(),
-        ));
-    }
-    CFDictionarySetValue(
-        gif_dict,
-        kCGImagePropertyGIFLoopCount as *const c_void,
-        loop_count_ref as *const c_void,
-    );
-
-    let container_props =
-        CFDictionaryCreateMutable(std::ptr::null(), 1, std::ptr::null(), std::ptr::null());
-    if container_props.is_null() {
-        CFRelease(gif_dict as CFTypeRef);
-        CFRelease(loop_count_ref as CFTypeRef);
-        CFRelease(dest as CFTypeRef);
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CFDictionaryCreateMutable failed for top-level GIF properties".into(),
-        ));
-    }
-    CFDictionarySetValue(
-        container_props,
-        kCGImagePropertyGIFDictionary as *const c_void,
-        gif_dict as *const c_void,
-    );
-    CGImageDestinationSetProperties(dest, container_props as CFDictionaryRef);
-
-    for (pixels, delay_ms) in frames {
-        let delay = (*delay_ms).max(10) as f32 / 1000.0;
-        let delay_ref = CFNumberCreate(
-            std::ptr::null(),
-            CF_NUMBER_FLOAT32_TYPE,
-            &delay as *const f32 as *const c_void,
-        );
-        if delay_ref.is_null() {
-            CFRelease(container_props as CFTypeRef);
-            CFRelease(gif_dict as CFTypeRef);
-            CFRelease(loop_count_ref as CFTypeRef);
-            CFRelease(dest as CFTypeRef);
-            CFRelease(out_data as CFTypeRef);
-            return Err(Error::EncodeError(
-                "CFNumberCreate failed for GIF delay".into(),
-            ));
-        }
-
-        let frame_gif_dict =
-            CFDictionaryCreateMutable(std::ptr::null(), 1, std::ptr::null(), std::ptr::null());
-        if frame_gif_dict.is_null() {
-            CFRelease(delay_ref as CFTypeRef);
-            CFRelease(container_props as CFTypeRef);
-            CFRelease(gif_dict as CFTypeRef);
-            CFRelease(loop_count_ref as CFTypeRef);
-            CFRelease(dest as CFTypeRef);
-            CFRelease(out_data as CFTypeRef);
-            return Err(Error::EncodeError(
-                "CFDictionaryCreateMutable failed for GIF frame properties".into(),
-            ));
-        }
-        CFDictionarySetValue(
-            frame_gif_dict,
-            kCGImagePropertyGIFDelayTime as *const c_void,
-            delay_ref as *const c_void,
-        );
-
-        let frame_props =
-            CFDictionaryCreateMutable(std::ptr::null(), 1, std::ptr::null(), std::ptr::null());
-        if frame_props.is_null() {
-            CFRelease(frame_gif_dict as CFTypeRef);
-            CFRelease(delay_ref as CFTypeRef);
-            CFRelease(container_props as CFTypeRef);
-            CFRelease(gif_dict as CFTypeRef);
-            CFRelease(loop_count_ref as CFTypeRef);
-            CFRelease(dest as CFTypeRef);
-            CFRelease(out_data as CFTypeRef);
-            return Err(Error::EncodeError(
-                "CFDictionaryCreateMutable failed for GIF image properties".into(),
-            ));
-        }
-        CFDictionarySetValue(
-            frame_props,
-            kCGImagePropertyGIFDictionary as *const c_void,
-            frame_gif_dict as *const c_void,
-        );
-
-        let image = make_cgimage_from_rgba(pixels, w, h)?;
-        CGImageDestinationAddImage(dest, image, frame_props as CFDictionaryRef);
-        CGImageRelease(image);
-        CFRelease(frame_props as CFTypeRef);
-        CFRelease(frame_gif_dict as CFTypeRef);
-        CFRelease(delay_ref as CFTypeRef);
-    }
-
-    CFRelease(container_props as CFTypeRef);
-    CFRelease(gif_dict as CFTypeRef);
-    CFRelease(loop_count_ref as CFTypeRef);
-
-    if CGImageDestinationFinalize(dest) == 0 {
-        CFRelease(dest as CFTypeRef);
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CGImageDestinationFinalize failed".into(),
-        ));
-    }
-
-    let len = CFDataGetLength(out_data as CFDataRef);
-    let ptr = CFDataGetBytePtr(out_data as CFDataRef);
-    let bytes = if len <= 0 || ptr.is_null() {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(ptr, len as usize).to_vec()
-    };
-
-    CFRelease(dest as CFTypeRef);
-    CFRelease(out_data as CFTypeRef);
-    Ok(bytes)
-}
-
 unsafe fn transcode_gif(
     src: CGImageSourceRef,
     frame_count: usize,
@@ -540,20 +291,12 @@ unsafe fn transcode_gif(
         ));
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        return super::gif_imagequant_encode::encode_gif(
-            &encode::merge_frames_min_delay(frames),
-            target_w,
-            target_h,
-            options.quality,
-        );
-    }
-
-    #[cfg(target_os = "ios")]
-    {
-        return encode_animated_gif(&encode::merge_frames_min_delay(frames), target_w, target_h);
-    }
+    return super::gif_imagequant_encode::encode_gif(
+        &encode::merge_frames_min_delay(frames),
+        target_w,
+        target_h,
+        options.quality,
+    );
 }
 
 // ---------------------------------------------------------------------------

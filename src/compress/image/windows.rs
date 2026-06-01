@@ -1004,11 +1004,11 @@ unsafe fn transcode_gif_wic(
         ));
     }
 
-    encode_animated_gif_wic(
-        factory,
+    super::gif_imagequant_encode::encode_gif(
         &encode::merge_frames_min_delay(frames),
         target_w,
         target_h,
+        options.quality,
     )
 }
 

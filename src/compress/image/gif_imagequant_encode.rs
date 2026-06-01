@@ -200,7 +200,7 @@ fn crop_indexed_region(
     out
 }
 
-pub(super) fn encode_gif(
+pub(crate) fn encode_gif(
     frames: &[(Vec<u8>, i32)],
     w: u32,
     h: u32,

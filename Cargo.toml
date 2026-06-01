@@ -37,6 +37,14 @@ imagequant = { version = "4.4", default-features = false }
 gif = "0.13"
 imagequant = { version = "4.4", default-features = false }
 
+[target.'cfg(target_os = "ios")'.dependencies]
+gif = "0.13"
+imagequant = { version = "4.4", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gif = "0.13"
+imagequant = { version = "4.4", default-features = false }
+
 [dev-dependencies]
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

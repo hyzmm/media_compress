@@ -46,5 +46,10 @@ pub fn transcode_gif(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, 
         ));
     }
 
-    super::gif_encode::encode_gif(&encode::merge_frames_min_delay(frames), target_w, target_h)
+    super::super::gif_imagequant_encode::encode_gif(
+        &encode::merge_frames_min_delay(frames),
+        target_w,
+        target_h,
+        options.quality,
+    )
 }

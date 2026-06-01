@@ -13,7 +13,12 @@ pub(crate) mod resize;
 #[cfg(not(target_arch = "wasm32"))]
 mod turbojpeg_encode;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
 mod gif_imagequant_encode;
 
 // Platform-specific decoder modules

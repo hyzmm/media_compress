@@ -1,6 +1,5 @@
 mod a_image_decoder;
 mod gif_codec;
-mod gif_encode;
 mod jni_bitmap_factory;
 
 use crate::compress::image::CompressOptions;
