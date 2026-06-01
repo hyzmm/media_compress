@@ -1125,7 +1125,12 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
-            encode_jpeg_wic(factory, &resized, target_w, target_h)
+            super::turbojpeg_encode::encode_rgba_to_jpeg(
+                &resized,
+                target_w,
+                target_h,
+                options.quality,
+            )
         } else {
             // ── Animated non-GIF image ─────────────────────────────────────
             // Export a JPEG poster frame from the first decoded frame.
@@ -1151,7 +1156,12 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&pixels0, w, h, target_w, target_h);
-            encode_jpeg_wic(factory, &resized, target_w, target_h)
+            super::turbojpeg_encode::encode_rgba_to_jpeg(
+                &resized,
+                target_w,
+                target_h,
+                options.quality,
+            )
         };
 
         com_call!(decoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);

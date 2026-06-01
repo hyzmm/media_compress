@@ -251,7 +251,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
-            super::encode_rgba_to_jpeg_jni(&resized, target_w, target_h, options.quality)
+            super::encode_rgba_to_jpeg_turbo(&resized, target_w, target_h, options.quality)
         } else {
             // For non-GIF animations, export a JPEG poster frame.
             let ret = (api.AImageDecoder_decodeImage)(
@@ -275,7 +275,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
 
             let rgba = compact_rgba(&buf, w, h, stride);
             let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
-            super::encode_rgba_to_jpeg_jni(&resized, target_w, target_h, options.quality)
+            super::encode_rgba_to_jpeg_turbo(&resized, target_w, target_h, options.quality)
         };
 
         (api.AImageDecoder_delete)(dec);

@@ -10,6 +10,9 @@ mod orientation;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod resize;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod turbojpeg_encode;
+
 // Platform-specific decoder modules
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;

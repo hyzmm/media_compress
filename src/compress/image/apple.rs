@@ -135,20 +135,17 @@ extern "C" {
     static kCGImagePropertyGIFDictionary: CFStringRef;
     static kCGImagePropertyGIFDelayTime: CFStringRef;
     static kCGImagePropertyGIFLoopCount: CFStringRef;
-    static kCGImageDestinationLossyCompressionQuality: CFStringRef;
 }
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreServices", kind = "framework")]
 extern "C" {
-    static kUTTypeJPEG: CFStringRef;
     static kUTTypeGIF: CFStringRef;
 }
 
 #[cfg(target_os = "ios")]
 #[link(name = "MobileCoreServices", kind = "framework")]
 extern "C" {
-    static kUTTypeJPEG: CFStringRef;
     static kUTTypeGIF: CFStringRef;
 }
 
@@ -546,84 +543,6 @@ unsafe fn transcode_gif(
     encode_animated_gif(&encode::merge_frames_min_delay(frames), target_w, target_h)
 }
 
-unsafe fn encode_static_jpeg(
-    pixels: &[u8],
-    w: u32,
-    h: u32,
-    _quality: f32,
-) -> Result<Vec<u8>, Error> {
-    let out_data = CFDataCreateMutable(std::ptr::null(), 0);
-    if out_data.is_null() {
-        return Err(Error::EncodeError(
-            "CFDataCreateMutable returned null".into(),
-        ));
-    }
-
-    let dest = CGImageDestinationCreateWithData(out_data, kUTTypeJPEG, 1, std::ptr::null());
-    if dest.is_null() {
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CGImageDestinationCreateWithData failed for JPEG".into(),
-        ));
-    }
-
-    let quality = (_quality / 100.0).clamp(0.0, 1.0);
-    let quality_ref = CFNumberCreate(
-        std::ptr::null(),
-        CF_NUMBER_FLOAT32_TYPE,
-        &quality as *const f32 as *const c_void,
-    );
-    if quality_ref.is_null() {
-        CFRelease(dest as CFTypeRef);
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CFNumberCreate failed for JPEG quality".into(),
-        ));
-    }
-
-    let props = CFDictionaryCreateMutable(std::ptr::null(), 1, std::ptr::null(), std::ptr::null());
-    if props.is_null() {
-        CFRelease(quality_ref as CFTypeRef);
-        CFRelease(dest as CFTypeRef);
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CFDictionaryCreateMutable failed for JPEG properties".into(),
-        ));
-    }
-
-    CFDictionarySetValue(
-        props,
-        kCGImageDestinationLossyCompressionQuality as *const c_void,
-        quality_ref as *const c_void,
-    );
-
-    let image = make_cgimage_from_rgba(pixels, w, h)?;
-    CGImageDestinationAddImage(dest, image, props as CFDictionaryRef);
-    CGImageRelease(image);
-    CFRelease(props as CFTypeRef);
-    CFRelease(quality_ref as CFTypeRef);
-
-    if CGImageDestinationFinalize(dest) == 0 {
-        CFRelease(dest as CFTypeRef);
-        CFRelease(out_data as CFTypeRef);
-        return Err(Error::EncodeError(
-            "CGImageDestinationFinalize failed".into(),
-        ));
-    }
-
-    let len = CFDataGetLength(out_data as CFDataRef);
-    let ptr = CFDataGetBytePtr(out_data as CFDataRef);
-    let bytes = if len <= 0 || ptr.is_null() {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(ptr, len as usize).to_vec()
-    };
-
-    CFRelease(dest as CFTypeRef);
-    CFRelease(out_data as CFTypeRef);
-    Ok(bytes)
-}
-
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -660,7 +579,12 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             let (target_w, target_h) =
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
-            encode_static_jpeg(&resized, target_w, target_h, options.quality)
+            super::turbojpeg_encode::encode_rgba_to_jpeg(
+                &resized,
+                target_w,
+                target_h,
+                options.quality,
+            )
         } else {
             // ── Animated non-GIF image ─────────────────────────────────────
             // Export a JPEG poster frame.
@@ -669,7 +593,12 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let first_resized =
                 resize::resize_rgba_nearest(&first_pixels, w, h, target_w, target_h);
-            encode_static_jpeg(&first_resized, target_w, target_h, options.quality)
+            super::turbojpeg_encode::encode_rgba_to_jpeg(
+                &first_resized,
+                target_w,
+                target_h,
+                options.quality,
+            )
         };
 
         CFRelease(src as CFTypeRef);
