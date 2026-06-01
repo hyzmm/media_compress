@@ -540,7 +540,20 @@ unsafe fn transcode_gif(
         ));
     }
 
-    encode_animated_gif(&encode::merge_frames_min_delay(frames), target_w, target_h)
+    #[cfg(target_os = "macos")]
+    {
+        return super::gif_imagequant_encode::encode_gif(
+            &encode::merge_frames_min_delay(frames),
+            target_w,
+            target_h,
+            options.quality,
+        );
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        return encode_animated_gif(&encode::merge_frames_min_delay(frames), target_w, target_h);
+    }
 }
 
 // ---------------------------------------------------------------------------
