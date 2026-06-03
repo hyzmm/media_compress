@@ -50,8 +50,7 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
         let is_sof = matches!(
             marker,
-            0xC0
-                | 0xC1
+            0xC0 | 0xC1
                 | 0xC2
                 | 0xC3
                 | 0xC5
@@ -101,8 +100,8 @@ fn compress_with_min_1080_dimensions() {
     let constrained =
         compress_image(input, options).expect("compress_image with min 1080x1080 failed");
     assert!(is_jpeg(&constrained), "expected JPEG output for BMP input");
-    let (cw, ch) = image_dimensions(&constrained)
-        .expect("failed to parse constrained image dimensions");
+    let (cw, ch) =
+        image_dimensions(&constrained).expect("failed to parse constrained image dimensions");
 
     assert!(
         cw >= 1080 && ch >= 1080,
@@ -122,25 +121,20 @@ fn compress_with_min_1080_dimensions() {
 fn compress_test_image_gif_with_min_1080() {
     let input = include_bytes!("../test_images/test_image.gif");
 
-    let original = compress_image(input, CompressOptions::new(75.0))
-        .expect("compress_image gif baseline failed");
-    assert!(is_gif(&original), "expected GIF output for GIF input");
-    let (ow, oh) = gif_dimensions(&original).expect("failed to parse gif baseline dimensions");
-
     let mut options = CompressOptions::new(75.0);
     options.min_width = Some(1080);
     options.min_height = Some(1080);
 
-    let constrained =
-        compress_image(input, options).expect("compress_image gif with min 1080x1080 failed");
-    assert!(is_gif(&constrained), "expected GIF output for GIF input");
-    let (cw, ch) = gif_dimensions(&constrained).expect("failed to parse gif constrained dimensions");
-
-    assert_eq!(
-        (cw, ch),
-        (ow, oh),
-        "gif should not upscale when both min dimensions are 1080; got baseline {ow}x{oh}, constrained {cw}x{ch}"
-    );
+    let err = compress_image(input, options).expect_err("GIF input should return an error");
+    match err {
+        media_compress::Error::UnsupportedFormat(msg) => {
+            assert!(
+                msg.contains("GIF compression is not supported"),
+                "unexpected unsupported message: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedFormat for GIF input, got {other}"),
+    }
 }
 
 #[test]
@@ -180,7 +174,10 @@ fn compress_exif_rotate_90_jpg_to_out_images() {
 
     let output_bytes = compress_image(&input, CompressOptions::new(75.0))
         .expect("compress_image failed for portrait_2.jpg");
-    assert!(is_jpeg(&output_bytes), "expected JPEG output for JPEG input");
+    assert!(
+        is_jpeg(&output_bytes),
+        "expected JPEG output for JPEG input"
+    );
     assert!(!output_bytes.is_empty(), "compressed output is empty");
 
     let (w, h) = image_dimensions(&output_bytes).expect("failed to parse output dimensions");
@@ -194,7 +191,7 @@ fn compress_exif_rotate_90_jpg_to_out_images() {
         .unwrap_or_else(|e| panic!("cannot write {}: {}", out_path.display(), e));
 }
 
-/// Integration test: compress every file under `test_images/` to JPEG/GIF and
+/// Integration test: compress every supported file under `test_images/` to JPEG and
 /// write results to `out_images/`.
 ///
 /// Unsupported or unrecognised formats are silently skipped.
@@ -297,6 +294,12 @@ fn compress_all_test_images() {
             }
             Err(media_compress::Error::PlatformNotSupported(msg)) => {
                 eprintln!("  SKIP  {} — platform not supported: {}", file_name, msg);
+                skipped += 1;
+            }
+            Err(media_compress::Error::UnsupportedFormat(msg))
+                if is_gif(&data) && msg.contains("GIF compression is not supported") =>
+            {
+                eprintln!("  SKIP  {} — GIF compression disabled: {}", file_name, msg);
                 skipped += 1;
             }
             Err(e) => {

@@ -1,6 +1,5 @@
 use std::ffi::c_void;
 
-use super::encode;
 use super::orientation::apply_exif_orientation_rgba;
 use super::{compute_target_dimensions, resize, CompressOptions};
 use crate::error::Error;
@@ -55,10 +54,6 @@ const BITMAP_INFO: u32 = 0x2002;
 
 /// CFNumberType: kCFNumberSInt32Type = 3
 const CF_NUMBER_SINT32_TYPE: i32 = 3;
-/// CFNumberType: kCFNumberFloat32Type = 5
-const CF_NUMBER_FLOAT32_TYPE: i32 = 5;
-const DEFAULT_GIF_DELAY_MS: i32 = 100;
-
 // ---------------------------------------------------------------------------
 // FFI — CoreFoundation
 // ---------------------------------------------------------------------------
@@ -97,8 +92,6 @@ extern "C" {
     ) -> CFDictionaryRef;
 
     static kCGImagePropertyOrientation: CFStringRef;
-    static kCGImagePropertyGIFDictionary: CFStringRef;
-    static kCGImagePropertyGIFDelayTime: CFStringRef;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,43 +225,6 @@ unsafe fn get_frame_orientation(src: CGImageSourceRef, index: usize) -> u32 {
     }
 }
 
-unsafe fn get_gif_frame_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
-    let props = CGImageSourceCopyPropertiesAtIndex(src, index, std::ptr::null());
-    if props.is_null() {
-        return DEFAULT_GIF_DELAY_MS;
-    }
-
-    let gif_props = CFDictionaryGetValue(props, kCGImagePropertyGIFDictionary as CFTypeRef);
-    if gif_props.is_null() {
-        CFRelease(props as CFTypeRef);
-        return DEFAULT_GIF_DELAY_MS;
-    }
-
-    let delay_ref = CFDictionaryGetValue(
-        gif_props as CFDictionaryRef,
-        kCGImagePropertyGIFDelayTime as CFTypeRef,
-    );
-    if delay_ref.is_null() {
-        CFRelease(props as CFTypeRef);
-        return DEFAULT_GIF_DELAY_MS;
-    }
-
-    let mut delay: f32 = 0.1;
-    let ok = CFNumberGetValue(
-        delay_ref as CFNumberRef,
-        CF_NUMBER_FLOAT32_TYPE,
-        &mut delay as *mut f32 as *mut c_void,
-    );
-
-    CFRelease(props as CFTypeRef);
-
-    if ok == 0 {
-        DEFAULT_GIF_DELAY_MS
-    } else {
-        ((delay.max(0.01) * 1000.0).round() as i32).max(10)
-    }
-}
-
 unsafe fn encode_first_frame_to_jpeg(
     src: CGImageSourceRef,
     options: CompressOptions,
@@ -280,54 +236,21 @@ unsafe fn encode_first_frame_to_jpeg(
     super::turbojpeg_encode::encode_rgba_to_jpeg(&resized, target_w, target_h, options.quality)
 }
 
-unsafe fn collect_resized_gif_frames(
-    src: CGImageSourceRef,
-    frame_count: usize,
-    options: CompressOptions,
-) -> Result<(Vec<(Vec<u8>, i32)>, u32, u32), Error> {
-    let (first_pixels, src_w, src_h) = decode_frame(src, 0)?;
-    let (target_w, target_h) =
-        compute_target_dimensions(src_w, src_h, options.min_width, options.min_height);
-
-    let mut frames = Vec::with_capacity(frame_count);
-    frames.push((
-        resize::resize_rgba_nearest(&first_pixels, src_w, src_h, target_w, target_h),
-        get_gif_frame_delay_ms(src, 0),
-    ));
-
-    for index in 1..frame_count {
-        let (pixels, w, h) = decode_frame(src, index)?;
-        frames.push((
-            resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h),
-            get_gif_frame_delay_ms(src, index),
-        ));
-    }
-
-    Ok((frames, target_w, target_h))
-}
-
-unsafe fn transcode_gif(
-    src: CGImageSourceRef,
-    frame_count: usize,
-    options: CompressOptions,
-) -> Result<Vec<u8>, Error> {
-    let (frames, target_w, target_h) = collect_resized_gif_frames(src, frame_count, options)?;
-
-    super::gif_imagequant_encode::encode_gif(
-        &encode::merge_frames_min_delay(frames),
-        target_w,
-        target_h,
-        options.quality,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
+    if matches!(
+        crate::compress::image::ImageFormat::detect(input),
+        Some(crate::compress::image::ImageFormat::Gif)
+    ) {
+        return Err(Error::UnsupportedFormat(
+            "GIF compression is not supported".into(),
+        ));
+    }
+
     unsafe {
-        let detected = crate::compress::image::ImageFormat::detect(input);
         // Wrap raw bytes in a CFData — no copy, no allocator (null = default).
         let data_ref = CFDataCreate(std::ptr::null(), input.as_ptr(), input.len() as CFIndex);
         if data_ref.is_null() {
@@ -349,9 +272,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             return Err(Error::DecodeError("Image source has no frames".into()));
         }
 
-        let result = if matches!(detected, Some(crate::compress::image::ImageFormat::Gif)) {
-            transcode_gif(src, count, options)
-        } else if count == 1 {
+        let result = if count == 1 {
             // Static image -> JPEG.
             encode_first_frame_to_jpeg(src, options)
         } else {

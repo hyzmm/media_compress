@@ -1,6 +1,5 @@
 use std::ffi::c_void;
 
-use super::encode;
 use super::orientation::apply_exif_orientation_rgba;
 use super::{compute_target_dimensions, resize, CompressOptions, ImageFormat};
 use crate::error::Error;
@@ -942,83 +941,18 @@ unsafe fn query_orientation_from_path(mqr: *mut c_void, path: &str) -> Option<u3
     }
 }
 
-unsafe fn get_gif_frame_delay_ms(frame: *mut c_void) -> i32 {
-    let mut mqr: *mut c_void = std::ptr::null_mut();
-    let hr: HRESULT = com_call!(
-        frame,
-        WIC_FRAME_GET_METADATA_QUERY_READER,
-        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
-        &mut mqr
-    );
-    if hr != S_OK || mqr.is_null() {
-        return 100;
-    }
-
-    let delay_ms = query_orientation_from_path(mqr, "/grctlext/Delay\0")
-        .map(|delay_cs| (delay_cs.max(1) as i32) * 10)
-        .unwrap_or(100);
-
-    com_call!(mqr, 2, unsafe extern "system" fn(*mut c_void) -> u32);
-    delay_ms
-}
-
-unsafe fn transcode_gif_wic(
-    factory: *mut c_void,
-    decoder: *mut c_void,
-    frame_count: u32,
-    options: CompressOptions,
-) -> Result<Vec<u8>, Error> {
-    let mut frames = Vec::with_capacity(frame_count as usize);
-    let mut target_w = 0;
-    let mut target_h = 0;
-
-    for index in 0..frame_count {
-        let mut frame: *mut c_void = std::ptr::null_mut();
-        let hr: HRESULT = com_call!(
-            decoder,
-            WIC_DECODER_GET_FRAME,
-            unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
-            index,
-            &mut frame
-        );
-        if hr != S_OK || frame.is_null() {
-            return Err(Error::DecodeError(format!(
-                "IWICBitmapDecoder::GetFrame({}) failed for GIF: 0x{:08x}",
-                index, hr
-            )));
-        }
-
-        let delay_ms = get_gif_frame_delay_ms(frame);
-        let decoded = decode_wic_frame(factory, frame);
-        com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
-        let (pixels, w, h) = decoded?;
-
-        if index == 0 {
-            (target_w, target_h) =
-                compute_target_dimensions(w, h, options.min_width, options.min_height);
-        }
-
-        frames.push((
-            resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h),
-            delay_ms,
-        ));
-    }
-
-    super::gif_imagequant_encode::encode_gif(
-        &encode::merge_frames_min_delay(frames),
-        target_w,
-        target_h,
-        options.quality,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
+    if matches!(ImageFormat::detect(input), Some(ImageFormat::Gif)) {
+        return Err(Error::UnsupportedFormat(
+            "GIF compression is not supported".into(),
+        ));
+    }
+
     unsafe {
-        let detected = ImageFormat::detect(input);
         // Initialize COM in apartment-threaded mode (idempotent for same thread)
         CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
 
@@ -1096,9 +1030,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             ));
         }
 
-        let result = if matches!(detected, Some(ImageFormat::Gif)) {
-            transcode_gif_wic(factory, decoder, frame_count, options)
-        } else if frame_count == 1 {
+        let result = if frame_count == 1 {
             // ── Static image ────────────────────────────────────────────────
             let mut frame: *mut c_void = std::ptr::null_mut();
             let hr: HRESULT = com_call!(

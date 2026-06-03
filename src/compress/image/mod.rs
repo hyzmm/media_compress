@@ -1,9 +1,5 @@
 use crate::error::Error;
 
-// Shared native encoding/transcoding helpers (not needed on WASM).
-#[cfg(not(target_arch = "wasm32"))]
-mod encode;
-
 #[cfg(not(target_arch = "wasm32"))]
 mod orientation;
 
@@ -12,14 +8,6 @@ pub(crate) mod resize;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod turbojpeg_encode;
-
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android",
-    target_os = "windows"
-))]
-mod gif_imagequant_encode;
 
 // Platform-specific decoder modules
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -157,9 +145,9 @@ pub(crate) fn compute_target_dimensions(
 /// # Platform support
 /// | Platform | Formats                                   |
 /// |----------|-------------------------------------------|
-/// | macOS / iOS | JPEG, PNG, GIF, BMP, HEIC, TIFF, WebP |
-/// | Android (API 24+) | JPEG, PNG, GIF, BMP, WebP, TIFF |
-/// | Windows  | JPEG, PNG, GIF, BMP, TIFF, WebP          |
+/// | macOS / iOS | JPEG, PNG, BMP, HEIC, TIFF, WebP |
+/// | Android (API 24+) | JPEG, PNG, BMP, WebP, TIFF |
+/// | Windows  | JPEG, PNG, BMP, TIFF, WebP          |
 /// | Web/WASM | not supported (decode on the JS side)     |
 pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     // Validate or detect format (used only for error messages if the platform
@@ -167,6 +155,12 @@ pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>,
     let fmt = ImageFormat::detect(input).ok_or_else(|| {
         Error::UnsupportedFormat("Cannot detect image format from magic bytes".into())
     })?;
+
+    if matches!(fmt, ImageFormat::Gif) {
+        return Err(Error::UnsupportedFormat(
+            "GIF compression is not supported".into(),
+        ));
+    }
 
     // Whether the source format is one of the common lossy/lossless formats
     // that may already be well-compressed. If the output ends up larger than

@@ -154,7 +154,9 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     if matches!(ImageFormat::detect(input), Some(ImageFormat::Gif)) {
-        return super::gif_codec::transcode_gif(input, options);
+        return Err(Error::UnsupportedFormat(
+            "GIF compression is not supported".into(),
+        ));
     }
 
     let api = match api() {

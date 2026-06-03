@@ -89,6 +89,9 @@ pub async fn compress_image_js(
 ) -> Result<Uint8Array, JsValue> {
     let detected = ImageFormat::detect(input);
     let input_is_gif = matches!(detected, Some(ImageFormat::Gif));
+    if input_is_gif {
+        return Err(JsValue::from_str("GIF compression is not supported"));
+    }
     let may_fallback = detected.map_or(false, |fmt| fmt.should_use_original_if_larger());
 
     let js_bytes = Uint8Array::from(input);

@@ -30,22 +30,6 @@ web-sys = { version = "0.3", features = [
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk-context = "0.1"
-gif = "0.13"
-imagequant = { version = "4.4", default-features = false }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-gif = "0.13"
-imagequant = { version = "4.4", default-features = false }
-
-[target.'cfg(target_os = "ios")'.dependencies]
-gif = "0.13"
-imagequant = { version = "4.4", default-features = false }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-gif = "0.13"
-imagequant = { version = "4.4", default-features = false }
-
-[dev-dependencies]
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
