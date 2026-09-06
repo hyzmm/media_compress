@@ -3,6 +3,14 @@ use crate::error::Error;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;
 
+#[cfg(target_os = "android")]
+mod android;
+
+// Pure-Rust YUV helpers used by the Android path; compiled on Android and
+// during `cargo test` (so its unit tests run on the host).
+#[cfg(any(target_os = "android", test))]
+mod yuv;
+
 // ---------------------------------------------------------------------------
 // Supported input video container formats
 // ---------------------------------------------------------------------------
@@ -125,29 +133,36 @@ pub(crate) fn compute_video_target_dimensions(
 ///   never upscales, and keeps audio re-encoded to AAC when present.
 ///
 /// # Platform support
-/// Currently implemented for macOS / iOS via AVFoundation. Other platforms
-/// return `Error::PlatformNotSupported`.
+/// Implemented for macOS / iOS (AVFoundation) and Android (MediaCodec). Other
+/// platforms return `Error::PlatformNotSupported`.
 pub fn compress_video(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, Error> {
     VideoFormat::detect(input).ok_or_else(|| {
         Error::UnsupportedFormat("Cannot detect video format from magic bytes".into())
     })?;
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        let compressed = apple::compress(input, options)?;
-        if compressed.len() > input.len() {
-            return Ok(input.to_vec());
-        }
-        Ok(compressed)
-    }
+    let compressed = compress_video_platform(input, options)?;
 
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    {
-        let _ = &options;
-        Err(Error::PlatformNotSupported(
-            "Video compression is currently only supported on macOS/iOS".into(),
-        ))
+    if compressed.len() > input.len() {
+        return Ok(input.to_vec());
     }
+    Ok(compressed)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn compress_video_platform(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, Error> {
+    apple::compress(input, options)
+}
+
+#[cfg(target_os = "android")]
+fn compress_video_platform(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, Error> {
+    android::compress(input, options)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+fn compress_video_platform(_input: &[u8], _options: VideoCompressOptions) -> Result<Vec<u8>, Error> {
+    Err(Error::PlatformNotSupported(
+        "Video compression is currently only supported on macOS/iOS/Android".into(),
+    ))
 }
 
 #[cfg(test)]

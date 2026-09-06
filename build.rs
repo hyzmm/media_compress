@@ -11,6 +11,7 @@ fn main() {
         }
         "android" => {
             println!("cargo:rustc-link-lib=jnigraphics");
+            println!("cargo:rustc-link-lib=mediandk");
             // Disable packed relocations (DT_ANDROID_RELR) so binaries
             // compiled for api30+ can still run on older Android versions.
             println!("cargo:rustc-link-arg=-Wl,--pack-dyn-relocs=none");

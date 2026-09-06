@@ -1,2 +1,3 @@
 [test_data]
 test_images = "test_images"
+test_videos = "test_videos"

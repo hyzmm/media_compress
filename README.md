@@ -139,9 +139,12 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 // out 是 Uint8Array：非 GIF 通常为 JPEG；GIF 输入通常为 GIF
 ```
 
-## 视频压缩（macOS / iOS）
+## 视频压缩（macOS / iOS / Android）
 
-通过 AVFoundation 转码为 H.264 + MP4，音频重编码为 AAC。压缩参数为目标码率 + 分辨率上限，只缩小不放大、保持宽高比；若压缩后更大则返回原始字节。
+- macOS / iOS：通过 AVFoundation（AVAssetReader/AVAssetWriter）转码。
+- Android：通过 NDK 原生 MediaCodec + MediaMuxer（libmediandk）转码，无需调用方注入 `JavaVM`。
+
+统一输出 H.264 + MP4，音频重编码为 AAC。压缩参数为目标码率 + 分辨率上限，只缩小不放大、保持宽高比；若压缩后更大则返回原始字节。
 
 ```rust
 use media_compress::{compress_video, VideoCompressOptions};
@@ -154,7 +157,7 @@ let out = compress_video(&input, options)?;
 std::fs::write("out.mp4", out)?;
 ```
 
-- 支持的源容器：MP4 / MOV（QuickTime）等 AVFoundation 可解码格式。
+- 支持的源容器：MP4 / MOV（QuickTime）等平台可解码格式。
 - 竖屏/旋转视频的旋正暂未处理，作为后续项。
 
 ## Android 集成与初始化
