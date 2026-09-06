@@ -1,6 +1,8 @@
 /target
 /test_images
 /out_images
+/test_videos
+/out_videos
 .DS_Store
 pkg
 android-test-harness

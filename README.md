@@ -1,6 +1,6 @@
 # media_compress
 
-跨平台图片压缩库（Rust），非 GIF 输入统一输出为有损 JPEG，GIF 输入保持为 GIF。
+跨平台图片/视频压缩库（Rust）。图片：非 GIF 输入统一输出为有损 JPEG，GIF 输入保持为 GIF；视频：输出 H.264 + MP4（AAC 音频）。
 
 ## 实现方案
 
@@ -139,6 +139,24 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 // out 是 Uint8Array：非 GIF 通常为 JPEG；GIF 输入通常为 GIF
 ```
 
+## 视频压缩（macOS / iOS）
+
+通过 AVFoundation 转码为 H.264 + MP4，音频重编码为 AAC。压缩参数为目标码率 + 分辨率上限，只缩小不放大、保持宽高比；若压缩后更大则返回原始字节。
+
+```rust
+use media_compress::{compress_video, VideoCompressOptions};
+
+let input = std::fs::read("input.mp4")?;
+let mut options = VideoCompressOptions::new(2000); // 目标码率 2000 kbps
+options.max_width = Some(1280);
+options.max_height = Some(720);
+let out = compress_video(&input, options)?;
+std::fs::write("out.mp4", out)?;
+```
+
+- 支持的源容器：MP4 / MOV（QuickTime）等 AVFoundation 可解码格式。
+- 竖屏/旋转视频的旋正暂未处理，作为后续项。
+
 ## Android 集成与初始化
 
 本库在 Android 平台使用两条解码链路：
@@ -172,5 +190,5 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 
 ## 备注
 
-- 本库当前聚焦图片压缩（输出 JPEG/GIF），未包含视频压缩链路。
+- 本库图片压缩输出 JPEG/GIF；视频压缩输出 H.264/MP4（目前仅 macOS/iOS，见下方「视频压缩」）。
 - 如需更稳定的“业务压缩率基线”，建议在你们真实样本集上固定 `quality` 进行批量评测并记录 P50/P90。

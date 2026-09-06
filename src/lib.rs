@@ -5,6 +5,7 @@ pub mod error;
 mod android_runtime;
 
 pub use compress::image::{compress_image, CompressOptions, ImageFormat};
+pub use compress::video::{compress_video, VideoCompressOptions, VideoFormat};
 pub use error::Error;
 
 #[cfg(target_os = "android")]
