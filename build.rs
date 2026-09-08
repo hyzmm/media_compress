@@ -19,6 +19,8 @@ fn main() {
         "windows" => {
             println!("cargo:rustc-link-lib=windowscodecs");
             println!("cargo:rustc-link-lib=ole32");
+            println!("cargo:rustc-link-lib=mfplat");
+            println!("cargo:rustc-link-lib=mfreadwrite");
         }
         _ => {}
     }

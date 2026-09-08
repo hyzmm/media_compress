@@ -139,10 +139,11 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 // out 是 Uint8Array：非 GIF 通常为 JPEG；GIF 输入通常为 GIF
 ```
 
-## 视频压缩（macOS / iOS / Android）
+## 视频压缩（macOS / iOS / Android / Windows）
 
 - macOS / iOS：通过 AVFoundation（AVAssetReader/AVAssetWriter）转码。
 - Android：通过 NDK 原生 MediaCodec + MediaMuxer（libmediandk）转码，无需调用方注入 `JavaVM`。
+- Windows：通过 Media Foundation（IMFSourceReader / IMFSinkWriter）转码，视频解码为 RGB32、缩放后编码为 H.264，音频重编码为 AAC。
 
 统一输出 H.264 + MP4，音频重编码为 AAC。压缩参数为目标码率 + 分辨率上限，只缩小不放大、保持宽高比；若压缩后更大则返回原始字节。
 
@@ -193,5 +194,5 @@ std::fs::write("out.mp4", out)?;
 
 ## 备注
 
-- 本库图片压缩输出 JPEG/GIF；视频压缩输出 H.264/MP4（目前仅 macOS/iOS，见下方「视频压缩」）。
+- 本库图片压缩输出 JPEG/GIF；视频压缩输出 H.264/MP4（macOS / iOS / Android / Windows，见下方「视频压缩」）。
 - 如需更稳定的“业务压缩率基线”，建议在你们真实样本集上固定 `quality` 进行批量评测并记录 P50/P90。

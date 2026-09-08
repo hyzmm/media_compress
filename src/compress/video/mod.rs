@@ -6,10 +6,18 @@ mod apple;
 #[cfg(target_os = "android")]
 mod android;
 
+#[cfg(target_os = "windows")]
+mod windows;
+
 // Pure-Rust YUV helpers used by the Android path; compiled on Android and
 // during `cargo test` (so its unit tests run on the host).
 #[cfg(any(target_os = "android", test))]
 mod yuv;
+
+// Pure-Rust BGRA32 scaler used by the Windows path; compiled on Windows and
+// during `cargo test` (so its unit tests run on the host).
+#[cfg(any(target_os = "windows", test))]
+mod rgb;
 
 // ---------------------------------------------------------------------------
 // Supported input video container formats
@@ -133,8 +141,9 @@ pub(crate) fn compute_video_target_dimensions(
 ///   never upscales, and keeps audio re-encoded to AAC when present.
 ///
 /// # Platform support
-/// Implemented for macOS / iOS (AVFoundation) and Android (MediaCodec). Other
-/// platforms return `Error::PlatformNotSupported`.
+/// Implemented for macOS / iOS (AVFoundation), Android (MediaCodec) and
+/// Windows (Media Foundation). Other platforms return
+/// `Error::PlatformNotSupported`.
 pub fn compress_video(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, Error> {
     VideoFormat::detect(input).ok_or_else(|| {
         Error::UnsupportedFormat("Cannot detect video format from magic bytes".into())
@@ -158,10 +167,20 @@ fn compress_video_platform(input: &[u8], options: VideoCompressOptions) -> Resul
     android::compress(input, options)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+#[cfg(target_os = "windows")]
+fn compress_video_platform(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, Error> {
+    windows::compress(input, options)
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+)))]
 fn compress_video_platform(_input: &[u8], _options: VideoCompressOptions) -> Result<Vec<u8>, Error> {
     Err(Error::PlatformNotSupported(
-        "Video compression is currently only supported on macOS/iOS/Android".into(),
+        "Video compression is currently only supported on macOS/iOS/Android/Windows".into(),
     ))
 }
 
