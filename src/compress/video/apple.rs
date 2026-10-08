@@ -88,7 +88,14 @@ const AV_ASSET_WRITER_STATUS_COMPLETED: isize = 2;
 // FFI — Objective-C runtime
 // ---------------------------------------------------------------------------
 
-#[allow(clashing_extern_declarations)]
+// `objc_msgSend` must be declared exactly once. rustc merges every declaration
+// of the same symbol into a single LLVM declaration and picks one signature for
+// it - including its `sret` attribute. Declaring one symbol with many different
+// signatures (as this file used to) therefore lowers every call site with that
+// one signature: the receiver ends up in x8 instead of x0, the selector moves to
+// x0, and the process crashes inside objc_msgSend. Each helper below instead
+// transmutes the symbol address to the exact signature it needs, the same
+// approach the `objc2` crate uses for `msg_send!`.
 #[link(name = "objc", kind = "dylib")]
 extern "C" {
     fn objc_getClass(name: *const c_char) -> Id;
@@ -97,47 +104,54 @@ extern "C" {
     fn objc_autoreleasePoolPop(pool: *mut c_void);
 
     #[link_name = "objc_msgSend"]
-    fn msg_id(receiver: Id, sel: Sel) -> Id;
-    #[link_name = "objc_msgSend"]
-    fn msg_id1(receiver: Id, sel: Sel, a: Id) -> Id;
-    #[link_name = "objc_msgSend"]
-    fn msg_id2(receiver: Id, sel: Sel, a: Id, b: Id) -> Id;
-    #[link_name = "objc_msgSend"]
-    fn msg_id_err(receiver: Id, sel: Sel, a: Id, err: *mut *mut c_void) -> Id;
-    #[link_name = "objc_msgSend"]
-    fn msg_id2_err(receiver: Id, sel: Sel, a: Id, b: Id, err: *mut *mut c_void) -> Id;
-    #[link_name = "objc_msgSend"]
-    fn msg_void(receiver: Id, sel: Sel);
-    #[link_name = "objc_msgSend"]
-    fn msg_void1(receiver: Id, sel: Sel, a: Id);
-    #[link_name = "objc_msgSend"]
-    fn msg_bool(receiver: Id, sel: Sel) -> u8;
-    #[link_name = "objc_msgSend"]
-    fn msg_bool1(receiver: Id, sel: Sel, a: Id) -> u8;
-    #[link_name = "objc_msgSend"]
-    fn msg_isize(receiver: Id, sel: Sel) -> isize;
-    #[link_name = "objc_msgSend"]
-    fn msg_usize(receiver: Id, sel: Sel) -> usize;
-    #[link_name = "objc_msgSend"]
-    fn msg_size(receiver: Id, sel: Sel) -> CGSize;
-    #[link_name = "objc_msgSend"]
-    fn msg_set_size(receiver: Id, sel: Sel, size: CGSize);
-    #[link_name = "objc_msgSend"]
-    fn msg_set_cmtime(receiver: Id, sel: Sel, time: CMTime);
-    #[link_name = "objc_msgSend"]
-    fn msg_set_transform(receiver: Id, sel: Sel, transform: CGAffineTransform, time: CMTime);
-    #[link_name = "objc_msgSend"]
-    fn msg_float(receiver: Id, sel: Sel) -> f32;
-    #[link_name = "objc_msgSend"]
-    fn msg_set_timerange(receiver: Id, sel: Sel, range: CMTimeRange);
-    // Large-struct return differs by arch: x86_64 uses the explicit stret
-    // trampoline, aarch64 returns indirectly via x8 (plain objc_msgSend).
-    #[cfg(target_arch = "x86_64")]
+    fn objc_msg_send_raw();
+}
+
+macro_rules! define_msg_send {
+    ($($name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?;)*) => {
+        $(
+            #[inline(always)]
+            unsafe fn $name(receiver: Id, sel: Sel $(, $arg: $ty)*) $(-> $ret)? {
+                let send: unsafe extern "C" fn(Id, Sel $(, $ty)*) $(-> $ret)? =
+                    std::mem::transmute(objc_msg_send_raw as unsafe extern "C" fn());
+                send(receiver, sel $(, $arg)*)
+            }
+        )*
+    };
+}
+
+define_msg_send! {
+    msg_id() -> Id;
+    msg_id1(a: Id) -> Id;
+    msg_id2(a: Id, b: Id) -> Id;
+    msg_id_err(a: Id, err: *mut *mut c_void) -> Id;
+    msg_id2_err(a: Id, b: Id, err: *mut *mut c_void) -> Id;
+    msg_void();
+    msg_void1(a: Id);
+    msg_bool() -> u8;
+    msg_bool1(a: Id) -> u8;
+    msg_isize() -> isize;
+    msg_usize() -> usize;
+    msg_size() -> CGSize;
+    msg_set_size(size: CGSize);
+    msg_set_cmtime(time: CMTime);
+    msg_set_transform(transform: CGAffineTransform, time: CMTime);
+    msg_float() -> f32;
+    msg_set_timerange(range: CMTimeRange);
+}
+
+// Large-struct return differs by arch: x86_64 uses the explicit stret
+// trampoline, aarch64 returns indirectly via x8 (plain objc_msgSend).
+#[cfg(target_arch = "x86_64")]
+#[link(name = "objc", kind = "dylib")]
+extern "C" {
     #[link_name = "objc_msgSend_stret"]
     fn msg_stret_cmtime(ret: *mut CMTime, receiver: Id, sel: Sel);
-    #[cfg(target_arch = "aarch64")]
-    #[link_name = "objc_msgSend"]
-    fn msg_cmtime(receiver: Id, sel: Sel) -> CMTime;
+}
+
+#[cfg(target_arch = "aarch64")]
+define_msg_send! {
+    msg_cmtime() -> CMTime;
 }
 
 // ---------------------------------------------------------------------------
