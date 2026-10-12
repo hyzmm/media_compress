@@ -17,13 +17,21 @@ const DEFAULT_DELAY_MS: i32 = 100;
 /// Decode raw image bytes with the browser-native `createImageBitmap`
 /// (JPEG, PNG, GIF, BMP, WebP, AVIF — varies by browser). For animated
 /// inputs this yields the first frame only.
+///
+/// Resolved off the global object rather than `window` so the same code also
+/// runs inside a `Worker`, which has no `window` (both `Window` and
+/// `WorkerGlobalScope` expose `createImageBitmap`).
 async fn decode_to_bitmap(input: &[u8]) -> Result<ImageBitmap, JsValue> {
     let bytes = Uint8Array::from(input);
     let array = js_sys::Array::of1(&bytes);
 
     let blob = Blob::new_with_u8_array_sequence(&array)?;
-    let window = web_sys::window().expect("no window");
-    let promise = window.create_image_bitmap_with_blob(&blob)?;
+    let global = js_sys::global();
+    let create_image_bitmap = js_sys::Reflect::get(&global, &JsValue::from_str("createImageBitmap"))?
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| JsValue::from_str("createImageBitmap is not available"))?;
+    let promise = create_image_bitmap.call1(&global, &blob)?.dyn_into::<js_sys::Promise>()?;
+
     JsFuture::from(promise).await?.dyn_into::<ImageBitmap>()
 }
 
