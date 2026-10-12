@@ -11,6 +11,12 @@ test_web_chrome:
 test_web_safari:
     PATH=$PATH:~/bin wasm-pack test --headless --safari --test compress_images_wasm_browser -- --nocapture
 
+test_web_chrome_zenwebp:
+    # Same browser tests with the pure-Rust zenwebp encoder (wasm ~+419 KiB).
+    # --features must come before `--` (args after `--` go to the wasm-bindgen
+    # test runner); --release because debug wasm zenwebp encoding is very slow.
+    PATH=$PATH:~/bin wasm-pack test --release --headless --chrome --test compress_images_wasm_browser --features web-zenwebp -- --nocapture
+
 test_ios:
     rustup target add aarch64-apple-ios-sim
     cargo install cargo-dinghy
@@ -41,3 +47,11 @@ test_all:
 
 build_android:
     cargo dinghy --platform auto-android-aarch64-api24 build --release
+
+build_web_canvas:
+    # Default: browser Canvas encoder (~32 KiB wasm).
+    wasm-pack build --release
+
+build_web_zenwebp:
+    # Pure-Rust zenwebp encoder (~450 KiB wasm; see README).
+    wasm-pack build --release -- --features web-zenwebp

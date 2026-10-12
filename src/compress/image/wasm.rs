@@ -6,10 +6,25 @@ use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Blob, ImageBitmapRenderingContext, ImageEncodeOptions, OffscreenCanvas};
+use web_sys::{Blob, ImageBitmap, OffscreenCanvas};
+#[cfg(not(feature = "web-zenwebp"))]
+use web_sys::{ImageBitmapRenderingContext, ImageEncodeOptions};
 
-/// Decode raw image bytes with `createImageBitmap`, draw onto `OffscreenCanvas`,
-/// and re-encode to WebP (or GIF for GIF input when browser supports GIF encode).
+/// Decode raw image bytes with the browser-native `createImageBitmap`
+/// (JPEG, PNG, GIF, BMP, WebP, AVIF — varies by browser).
+async fn decode_to_bitmap(input: &[u8]) -> Result<ImageBitmap, JsValue> {
+    let bytes = Uint8Array::from(input);
+    let array = js_sys::Array::of1(&bytes);
+
+    let blob = Blob::new_with_u8_array_sequence(&array)?;
+    let window = web_sys::window().expect("no window");
+    let promise = window.create_image_bitmap_with_blob(&blob)?;
+    JsFuture::from(promise).await?.dyn_into::<ImageBitmap>()
+}
+
+/// Default Web/WASM encoder: draw onto `OffscreenCanvas` and re-encode to WebP
+/// (or GIF for GIF input when the browser supports GIF encode).
+#[cfg(not(feature = "web-zenwebp"))]
 async fn canvas_compress(
     input: &[u8],
     input_is_gif: bool,
@@ -17,17 +32,7 @@ async fn canvas_compress(
     min_width: Option<u32>,
     min_height: Option<u32>,
 ) -> Result<Uint8Array, JsValue> {
-    let bytes = Uint8Array::from(input);
-    let array = js_sys::Array::of1(&bytes);
-
-    let blob = Blob::new_with_u8_array_sequence(&array)?;
-    let bitmap = {
-        let window = web_sys::window().expect("no window");
-        let promise = window.create_image_bitmap_with_blob(&blob)?;
-        JsFuture::from(promise)
-            .await?
-            .dyn_into::<web_sys::ImageBitmap>()?
-    };
+    let bitmap = decode_to_bitmap(input).await?;
 
     let (target_w, target_h) =
         compute_target_dimensions(bitmap.width(), bitmap.height(), min_width, min_height);
@@ -61,12 +66,57 @@ async fn canvas_compress(
     Ok(Uint8Array::new(&array_buf))
 }
 
-/// Compress raw image bytes to lossy WebP using the browser's Canvas API.
+/// `web-zenwebp` encoder: decode with `createImageBitmap`, pull the RGBA pixels
+/// back through a 2d canvas, and encode with the pure-Rust zenwebp crate.
+#[cfg(feature = "web-zenwebp")]
+async fn zenwebp_compress(
+    input: &[u8],
+    quality: f32,
+    min_width: Option<u32>,
+    min_height: Option<u32>,
+) -> Result<Uint8Array, JsValue> {
+    let bitmap = decode_to_bitmap(input).await?;
+    let (target_w, target_h) =
+        compute_target_dimensions(bitmap.width(), bitmap.height(), min_width, min_height);
+
+    let canvas = OffscreenCanvas::new(target_w, target_h)?;
+    let ctx = canvas
+        .get_context("2d")?
+        .expect("2d context not available")
+        .dyn_into::<web_sys::OffscreenCanvasRenderingContext2d>()?;
+    ctx.draw_image_with_image_bitmap_and_dw_and_dh(
+        &bitmap,
+        0.0,
+        0.0,
+        target_w as f64,
+        target_h as f64,
+    )?;
+
+    let image_data = ctx.get_image_data(0.0, 0.0, target_w as f64, target_h as f64)?;
+    let pixels = image_data.data();
+
+    let config = zenwebp::LossyConfig::new()
+        .with_quality(quality)
+        .with_method(4);
+    let webp = zenwebp::EncodeRequest::lossy(
+        &config,
+        pixels.as_slice(),
+        zenwebp::PixelLayout::Rgba8,
+        target_w,
+        target_h,
+    )
+    .encode()
+    .map_err(|e| JsValue::from_str(&format!("zenwebp encode failed: {e}")))?;
+
+    Ok(Uint8Array::from(webp.as_slice()))
+}
+
+/// Compress raw image bytes to lossy WebP on the WASM/Web platform.
 ///
-/// This is the async, browser-native alternative to `compress_image` on the
-/// WASM/Web platform. Decoding is handled by `createImageBitmap` (supports
-/// JPEG, PNG, GIF, BMP, WebP, AVIF — varies by browser), and encoding is
-/// done via `OffscreenCanvas.convertToBlob`.
+/// Decoding is always browser-native via `createImageBitmap` (supports JPEG,
+/// PNG, GIF, BMP, WebP, AVIF — varies by browser). Encoding goes through
+/// `OffscreenCanvas.convertToBlob` by default, or through the pure-Rust
+/// `zenwebp` encoder when built with `--features web-zenwebp`.
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image
@@ -95,6 +145,10 @@ pub async fn compress_image_js(
     let may_fallback = detected.map_or(false, |fmt| fmt.should_use_original_if_larger());
 
     let js_bytes = Uint8Array::from(input);
+
+    #[cfg(feature = "web-zenwebp")]
+    let compressed = zenwebp_compress(input, quality, min_width, min_height).await?;
+    #[cfg(not(feature = "web-zenwebp"))]
     let compressed = canvas_compress(input, input_is_gif, quality, min_width, min_height).await?;
 
     if may_fallback && compressed.length() as usize > input.len() {
