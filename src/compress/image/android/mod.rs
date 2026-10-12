@@ -100,12 +100,3 @@ fn orientation_from_metadata_with_env(env: &mut jni::JNIEnv, input: &[u8]) -> Op
         Some(1)
     }
 }
-
-pub(super) fn encode_rgba_to_jpeg_turbo(
-    rgba: &[u8],
-    w: u32,
-    h: u32,
-    quality: f32,
-) -> Result<Vec<u8>, Error> {
-    super::turbojpeg_encode::encode_rgba_to_jpeg(rgba, w, h, quality)
-}

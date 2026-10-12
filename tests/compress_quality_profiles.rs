@@ -111,6 +111,8 @@ fn compare_quality_profiles() {
                     format_aggs[i].record(input.len(), out.len());
                 }
                 Err(media_compress::Error::PlatformNotSupported(_)) => {}
+                Err(media_compress::Error::UnsupportedFormat(_))
+                    if matches!(format, ImageFormat::Gif) => {}
                 Err(e) => panic!("compress_image failed for {}: {}", path.display(), e),
             }
         }

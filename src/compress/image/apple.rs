@@ -225,7 +225,7 @@ unsafe fn get_frame_orientation(src: CGImageSourceRef, index: usize) -> u32 {
     }
 }
 
-unsafe fn encode_first_frame_to_jpeg(
+unsafe fn encode_first_frame_to_webp(
     src: CGImageSourceRef,
     options: CompressOptions,
 ) -> Result<Vec<u8>, Error> {
@@ -233,7 +233,7 @@ unsafe fn encode_first_frame_to_jpeg(
     let (target_w, target_h) =
         compute_target_dimensions(w, h, options.min_width, options.min_height);
     let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
-    super::turbojpeg_encode::encode_rgba_to_jpeg(&resized, target_w, target_h, options.quality)
+    super::webp_encode::encode_static(&resized, target_w, target_h, options.quality)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,11 +273,11 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
         }
 
         let result = if count == 1 {
-            // Static image -> JPEG.
-            encode_first_frame_to_jpeg(src, options)
+            // Static image -> WebP.
+            encode_first_frame_to_webp(src, options)
         } else {
-            // Animated non-GIF -> JPEG poster frame.
-            encode_first_frame_to_jpeg(src, options)
+            // Animated non-GIF -> WebP poster frame.
+            encode_first_frame_to_webp(src, options)
         };
 
         CFRelease(src as CFTypeRef);

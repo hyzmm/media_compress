@@ -1,6 +1,6 @@
 # media_compress
 
-跨平台图片/视频压缩库（Rust）。图片：非 GIF 输入统一输出为有损 JPEG，GIF 输入保持为 GIF；视频：输出 H.264 + MP4（AAC 音频）。
+跨平台图片/视频压缩库（Rust）。图片：Native 平台（macOS/iOS/Android/Windows）非 GIF 输入统一输出为有损 WebP，Web/WASM 仍输出 JPEG；GIF 暂不支持；视频：输出 H.264 + MP4（AAC 音频）。
 
 ## 实现方案
 
@@ -9,8 +9,8 @@
 - 入口 API：`compress_image(input, options)`
 - Web 专用异步 API：`compress_image_js(input, quality, min_width?, min_height?)`
 - 编码目标：
-    - Native 平台：非 GIF 编码为 JPEG，GIF 重编码为 GIF
-    - Web/WASM：非 GIF 编码为 JPEG，GIF 优先编码为 GIF（不支持时保留原 GIF）
+    - Native 平台：非 GIF 统一编码为 WebP
+    - Web/WASM：编码为 JPEG
 - 格式识别：通过文件魔数自动检测（JPEG/PNG/GIF/BMP/WebP/TIFF/HEIC）
 - 结果保护：对可能已较优压缩的输入（WebP/JPEG/PNG/GIF），若压缩后更大则返回原图字节
 
@@ -18,42 +18,41 @@
 
 - macOS / iOS
     - 解码：ImageIO + CoreGraphics
-    - 动图：逐帧解码并读取帧延迟（GIF 等）
+    - 编码：libwebp（多线程）
 
 - Windows
     - 解码：WIC（Windows Imaging Component）
-    - 动图：读取多帧与元数据延迟，GIF 输入保持 GIF
+    - 编码：libwebp
 
 - Android
     - 首选：AImageDecoder（动态加载，API 30+）
     - 回退：JNI BitmapFactory（用于低版本或 AImageDecoder 不可用场景）。JNI 回退链路依赖可用的 `JavaVM`，宿主需在库加载时完成初始化（见下方"Android 集成与初始化"）
+    - 编码：libwebp
 
 - Web / WASM
     - 解码：`createImageBitmap`
-    - 编码：`OffscreenCanvas.convertToBlob`
-    - 输出：非 GIF 为 `image/jpeg`；GIF 优先 `image/gif`，不支持时保留原 GIF
+    - 编码：`OffscreenCanvas.convertToBlob`，输出 `image/jpeg`
     - 注意：WASM 平台应使用异步 `compress_image_js`，同步 `compress_image` 在 WASM 下会返回不支持
 
 ### 3. 压缩策略
 
 - 质量参数：`quality` 取值 0-100（常用 75）
 - 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
-- Native 编码配置：有损 JPEG（非 GIF）
-- 动图处理：
-    - GIF 输入：保留帧序与延迟，重编码输出 GIF
-    - 非 GIF 动图输入：导出 JPEG 首帧（poster frame）
+- Native 编码配置：有损 WebP + 多线程
+- GIF：暂不支持（`compress_image` 返回 `UnsupportedFormat`）
+- 动图处理：非 GIF 动图输入导出 WebP 首帧（poster frame）
 
 ## 各平台图片格式支持情况
 
 说明：下面是“按当前实现链路可达能力”的支持矩阵。浏览器和 Android 厂商实现可能导致个别机型差异。
 
-| 平台                             | 输入格式支持                                                                 | 输出格式   |
-| -------------------------------- | ---------------------------------------------------------------------------- | ---------- |
-| macOS / iOS                      | JPEG, PNG, GIF, BMP, WebP, HEIC, TIFF                                        | JPEG / GIF |
-| Windows                          | JPEG, PNG, GIF, BMP, WebP, TIFF（WIC 能力范围内）                            | JPEG / GIF |
-| Android (API 28+, AImageDecoder) | JPEG, PNG, GIF, BMP, WebP，及设备支持的其他系统解码格式（如部分 HEIF/AVIF）  | JPEG / GIF |
-| Android (API < 28 或回退 JNI)    | JPEG, PNG, GIF, BMP, WebP（HEIC/TIFF 不支持）                                | JPEG / GIF |
-| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器） | JPEG / GIF |
+| 平台                             | 输入格式支持                                                                 | 输出格式                  |
+| -------------------------------- | ---------------------------------------------------------------------------- | ------------------------- |
+| macOS / iOS                      | JPEG, PNG, BMP, WebP, HEIC, TIFF                                             | WebP                      |
+| Windows                          | JPEG, PNG, BMP, WebP, TIFF（WIC 能力范围内）                                 | WebP                      |
+| Android (API 28+, AImageDecoder) | JPEG, PNG, BMP, WebP，及设备支持的其他系统解码格式（如部分 HEIF/AVIF）       | WebP                      |
+| Android (API < 28 或回退 JNI)    | JPEG, PNG, BMP, WebP（HEIC/TIFF 不支持）                                     | WebP                      |
+| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器） | JPEG                      |
 
 ## 大概压缩率数据（样本实测）
 
@@ -126,7 +125,7 @@ let options = CompressOptions {
     min_height: Some(720),
 };
 let out = compress_image(&input, options)?;
-std::fs::write("out.jpg", out)?;
+std::fs::write("out.webp", out)?;
 ```
 
 ### WebAssembly (Browser)
@@ -136,7 +135,7 @@ import init, { compress_image_js } from './pkg/media_compress.js';
 
 await init();
 const out = await compress_image_js(inputBytes, 75, 1280, 720);
-// out 是 Uint8Array：非 GIF 通常为 JPEG；GIF 输入通常为 GIF
+// out 是 Uint8Array，输出为 JPEG
 ```
 
 ## 视频压缩（macOS / iOS / Android / Windows）
@@ -194,5 +193,5 @@ std::fs::write("out.mp4", out)?;
 
 ## 备注
 
-- 本库图片压缩输出 JPEG/GIF；视频压缩输出 H.264/MP4（macOS / iOS / Android / Windows，见下方「视频压缩」）。
+- 本库图片压缩：Native 平台输出 WebP，Web/WASM 输出 JPEG（GIF 暂不支持）；视频压缩输出 H.264/MP4（macOS / iOS / Android / Windows，见下方「视频压缩」）。
 - 如需更稳定的“业务压缩率基线”，建议在你们真实样本集上固定 `quality` 进行批量评测并记录 P50/P90。

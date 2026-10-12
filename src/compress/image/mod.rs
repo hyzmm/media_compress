@@ -1,13 +1,14 @@
 use crate::error::Error;
 
+// Shared WebP encoding helpers (not needed on WASM which has no webp dependency)
+#[cfg(not(target_arch = "wasm32"))]
+mod webp_encode;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod orientation;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod resize;
-
-#[cfg(not(target_arch = "wasm32"))]
-mod turbojpeg_encode;
 
 // Platform-specific decoder modules
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -132,12 +133,12 @@ pub(crate) fn compute_target_dimensions(
     (dst_w, dst_h)
 }
 
-/// Compress an image to JPEG, while keeping GIF input as GIF.
+/// Compress an image to lossy WebP.
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image (any supported format)
 /// * `options` — compression options:
-///   - `quality`: JPEG quality, 0–100
+///   - `quality`: WebP lossy quality, 0–100
 ///   - `min_width` / `min_height`: optional lower bound for output size.
 ///     Compression may downscale while preserving aspect ratio, but will not
 ///     upscale when the source image is already smaller.

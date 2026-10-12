@@ -5,6 +5,7 @@ use jni::JNIEnv;
 use jni::JavaVM;
 
 use crate::compress::image::resize;
+use crate::compress::image::webp_encode;
 use crate::compress::image::ImageFormat;
 use crate::compress::image::{compute_target_dimensions, CompressOptions};
 use crate::error::Error;
@@ -49,7 +50,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
     let (target_w, target_h) =
         compute_target_dimensions(w, h, options.min_width, options.min_height);
     let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
-    super::encode_rgba_to_jpeg_turbo(&resized, target_w, target_h, options.quality)
+    webp_encode::encode_static(&resized, target_w, target_h, options.quality)
 }
 
 fn decode_to_rgba(input: &[u8]) -> Result<(Vec<u8>, u32, u32), Error> {

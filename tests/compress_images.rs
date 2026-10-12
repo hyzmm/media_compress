@@ -3,81 +3,19 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use media_compress::{compress_image, CompressOptions};
+use webp::BitstreamFeatures;
 
-fn is_jpeg(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\xff\xd8\xff")
+fn is_webp(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && &bytes[8..12] == b"WEBP"
 }
 
 fn is_gif(bytes: &[u8]) -> bool {
     bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
 }
 
-fn gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 10 || !is_gif(bytes) {
-        return None;
-    }
-    let w = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
-    let h = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
-    Some((w, h))
-}
-
-fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if !is_jpeg(bytes) || bytes.len() < 4 {
-        return None;
-    }
-
-    let mut i = 2usize;
-    while i + 9 < bytes.len() {
-        if bytes[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-
-        let marker = bytes[i + 1];
-        i += 2;
-
-        if marker == 0xD8 || marker == 0xD9 {
-            continue;
-        }
-        if i + 2 > bytes.len() {
-            return None;
-        }
-
-        let seg_len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
-        if seg_len < 2 || i + seg_len > bytes.len() {
-            return None;
-        }
-
-        let is_sof = matches!(
-            marker,
-            0xC0 | 0xC1
-                | 0xC2
-                | 0xC3
-                | 0xC5
-                | 0xC6
-                | 0xC7
-                | 0xC9
-                | 0xCA
-                | 0xCB
-                | 0xCD
-                | 0xCE
-                | 0xCF
-        );
-
-        if is_sof && seg_len >= 7 {
-            let h = u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]) as u32;
-            let w = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
-            return Some((w, h));
-        }
-
-        i += seg_len;
-    }
-
-    None
-}
-
-fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    jpeg_dimensions(bytes).or_else(|| gif_dimensions(bytes))
+fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let features = BitstreamFeatures::new(bytes)?;
+    Some((features.width(), features.height()))
 }
 
 #[test]
@@ -86,8 +24,8 @@ fn compress_with_min_1080_dimensions() {
 
     let original =
         compress_image(input, CompressOptions::new(75.0)).expect("compress_image baseline failed");
-    assert!(is_jpeg(&original), "expected JPEG output for BMP input");
-    let (ow, oh) = image_dimensions(&original).expect("failed to parse baseline image dimensions");
+    assert!(is_webp(&original), "expected WebP output for BMP input");
+    let (ow, oh) = webp_dimensions(&original).expect("failed to parse baseline WebP dimensions");
     assert!(
         ow > 1080 && oh > 1080,
         "fixture should be larger than 1080x1080, got {ow}x{oh}"
@@ -99,9 +37,9 @@ fn compress_with_min_1080_dimensions() {
 
     let constrained =
         compress_image(input, options).expect("compress_image with min 1080x1080 failed");
-    assert!(is_jpeg(&constrained), "expected JPEG output for BMP input");
+    assert!(is_webp(&constrained), "expected WebP output for BMP input");
     let (cw, ch) =
-        image_dimensions(&constrained).expect("failed to parse constrained image dimensions");
+        webp_dimensions(&constrained).expect("failed to parse constrained WebP dimensions");
 
     assert!(
         cw >= 1080 && ch >= 1080,
@@ -118,7 +56,7 @@ fn compress_with_min_1080_dimensions() {
 }
 
 #[test]
-fn compress_test_image_gif_with_min_1080() {
+fn compress_test_image_gif_is_unsupported() {
     let input = include_bytes!("../test_images/test_image.gif");
 
     let mut options = CompressOptions::new(75.0);
@@ -172,26 +110,23 @@ fn compress_exif_rotate_90_jpg_to_out_images() {
     let input = fs::read(&input_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {}", input_path.display(), e));
 
-    let output_bytes = compress_image(&input, CompressOptions::new(75.0))
+    let webp_bytes = compress_image(&input, CompressOptions::new(75.0))
         .expect("compress_image failed for portrait_2.jpg");
-    assert!(
-        is_jpeg(&output_bytes),
-        "expected JPEG output for JPEG input"
-    );
-    assert!(!output_bytes.is_empty(), "compressed output is empty");
+    assert!(is_webp(&webp_bytes), "expected WebP output for JPEG input");
+    assert!(!webp_bytes.is_empty(), "compressed output is empty");
 
-    let (w, h) = image_dimensions(&output_bytes).expect("failed to parse output dimensions");
+    let (w, h) = webp_dimensions(&webp_bytes).expect("failed to parse output WebP dimensions");
     assert!(
         h > w,
         "expected EXIF-rotated output to be portrait, got {w}x{h}"
     );
 
-    let out_path = output_dir.join("portrait_2.jpg.jpeg");
-    fs::write(&out_path, &output_bytes)
+    let out_path = output_dir.join("portrait_2.jpg.webp");
+    fs::write(&out_path, &webp_bytes)
         .unwrap_or_else(|e| panic!("cannot write {}: {}", out_path.display(), e));
 }
 
-/// Integration test: compress every supported file under `test_images/` to JPEG and
+/// Integration test: compress every supported file under `test_images/` to WebP and
 /// write results to `out_images/`.
 ///
 /// Unsupported or unrecognised formats are silently skipped.
@@ -260,15 +195,20 @@ fn compress_all_test_images() {
 
         let t0 = Instant::now();
         match compress_image(&data, CompressOptions::new(75.0)) {
-            Ok(output_bytes) => {
+            Ok(webp_bytes) => {
                 let elapsed = t0.elapsed();
                 assert!(
-                    !output_bytes.is_empty(),
+                    !webp_bytes.is_empty(),
                     "compress_image returned empty bytes for {}",
                     file_name
                 );
+                assert!(
+                    is_webp(&webp_bytes),
+                    "expected WebP output for {}",
+                    file_name
+                );
 
-                // Write output: append the original extension before final extension so
+                // Write output: append the original extension before .webp so
                 // files with the same stem (e.g. test_image.jpg / test_image.png)
                 // don't overwrite each other in out_images/.
                 let stem = path.file_stem().unwrap().to_string_lossy();
@@ -276,16 +216,15 @@ fn compress_all_test_images() {
                     .extension()
                     .map(|e| format!(".{}", e.to_string_lossy()))
                     .unwrap_or_default();
-                let out_ext = if is_gif(&output_bytes) { "gif" } else { "jpg" };
-                let out_name = format!("{}{}.{}", stem, orig_ext, out_ext);
+                let out_name = format!("{}{}.webp", stem, orig_ext);
                 let out_path = output_dir.join(&out_name);
-                fs::write(&out_path, &output_bytes)
+                fs::write(&out_path, &webp_bytes)
                     .unwrap_or_else(|e| panic!("cannot write {}: {}", out_path.display(), e));
 
-                let ratio = output_bytes.len() as f64 / original_size as f64 * 100.0;
+                let ratio = webp_bytes.len() as f64 / original_size as f64 * 100.0;
                 println!(
                     "    -> {} bytes ({:.1}% of original)  time: {:.2?}  saved to {}",
-                    output_bytes.len(),
+                    webp_bytes.len(),
                     ratio,
                     elapsed,
                     out_path.file_name().unwrap().to_string_lossy()
