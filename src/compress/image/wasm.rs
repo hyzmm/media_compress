@@ -9,7 +9,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Blob, ImageBitmapRenderingContext, ImageEncodeOptions, OffscreenCanvas};
 
 /// Decode raw image bytes with `createImageBitmap`, draw onto `OffscreenCanvas`,
-/// and re-encode to JPEG (or GIF for GIF input when browser supports GIF encode).
+/// and re-encode to WebP (or GIF for GIF input when browser supports GIF encode).
 async fn canvas_compress(
     input: &[u8],
     input_is_gif: bool,
@@ -50,18 +50,18 @@ async fn canvas_compress(
             Blob::new_with_u8_array_sequence(&js_sys::Array::of1(&Uint8Array::from(input)))?
         }
     } else {
-        let mut jpeg_opts = ImageEncodeOptions::new();
-        jpeg_opts.type_("image/jpeg");
-        jpeg_opts.quality((quality as f64) / 100.0);
-        let jpeg_result = JsFuture::from(canvas.convert_to_blob_with_options(&jpeg_opts)?).await?;
-        jpeg_result.dyn_into::<Blob>()?
+        let mut webp_opts = ImageEncodeOptions::new();
+        webp_opts.type_("image/webp");
+        webp_opts.quality((quality as f64) / 100.0);
+        let webp_result = JsFuture::from(canvas.convert_to_blob_with_options(&webp_opts)?).await?;
+        webp_result.dyn_into::<Blob>()?
     };
 
     let array_buf = JsFuture::from(blob.array_buffer()).await?;
     Ok(Uint8Array::new(&array_buf))
 }
 
-/// Compress raw image bytes using the browser's Canvas API.
+/// Compress raw image bytes to lossy WebP using the browser's Canvas API.
 ///
 /// This is the async, browser-native alternative to `compress_image` on the
 /// WASM/Web platform. Decoding is handled by `createImageBitmap` (supports
@@ -70,7 +70,7 @@ async fn canvas_compress(
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image
-/// * `quality` — JPEG quality, 0–100
+/// * `quality` — WebP lossy quality, 0–100
 /// * `min_width` / `min_height` — optional lower bound for output dimensions.
 ///   The output keeps the original aspect ratio and never upscales.
 ///
@@ -78,7 +78,7 @@ async fn canvas_compress(
 /// ```js
 /// import init, { compress_image_js } from './media_compress.js';
 /// await init();
-/// const bytes = await compress_image_js(imageBytes, 75, 1280, 720);
+/// const webpBytes = await compress_image_js(imageBytes, 75, 1280, 720);
 /// ```
 #[wasm_bindgen]
 pub async fn compress_image_js(

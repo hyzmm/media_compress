@@ -1,6 +1,6 @@
 # media_compress
 
-跨平台图片/视频压缩库（Rust）。图片：Native 平台（macOS/iOS/Android/Windows）非 GIF 输入统一输出为有损 WebP，Web/WASM 仍输出 JPEG；GIF 暂不支持；视频：输出 H.264 + MP4（AAC 音频）。
+跨平台图片/视频压缩库（Rust）。图片：非 GIF 输入统一输出为有损 WebP（Native 与 Web/WASM 一致）；GIF 暂不支持；视频：输出 H.264 + MP4（AAC 音频）。
 
 ## 实现方案
 
@@ -10,7 +10,7 @@
 - Web 专用异步 API：`compress_image_js(input, quality, min_width?, min_height?)`
 - 编码目标：
     - Native 平台：非 GIF 统一编码为 WebP
-    - Web/WASM：编码为 JPEG
+    - Web/WASM：`OffscreenCanvas.convertToBlob` 输出 `image/webp`
 - 格式识别：通过文件魔数自动检测（JPEG/PNG/GIF/BMP/WebP/TIFF/HEIC）
 - 结果保护：对可能已较优压缩的输入（WebP/JPEG/PNG/GIF），若压缩后更大则返回原图字节
 
@@ -31,7 +31,7 @@
 
 - Web / WASM
     - 解码：`createImageBitmap`
-    - 编码：`OffscreenCanvas.convertToBlob`，输出 `image/jpeg`
+    - 编码：`OffscreenCanvas.convertToBlob`，输出 `image/webp`
     - 注意：WASM 平台应使用异步 `compress_image_js`，同步 `compress_image` 在 WASM 下会返回不支持
 
 ### 3. 压缩策略
@@ -52,7 +52,7 @@
 | Windows                          | JPEG, PNG, BMP, WebP, TIFF（WIC 能力范围内）                                 | WebP                      |
 | Android (API 28+, AImageDecoder) | JPEG, PNG, BMP, WebP，及设备支持的其他系统解码格式（如部分 HEIF/AVIF）       | WebP                      |
 | Android (API < 28 或回退 JNI)    | JPEG, PNG, BMP, WebP（HEIC/TIFF 不支持）                                     | WebP                      |
-| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器） | JPEG                      |
+| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器） | WebP                      |
 
 ## 大概压缩率数据（样本实测）
 
@@ -135,7 +135,7 @@ import init, { compress_image_js } from './pkg/media_compress.js';
 
 await init();
 const out = await compress_image_js(inputBytes, 75, 1280, 720);
-// out 是 Uint8Array，输出为 JPEG
+// out 是 Uint8Array，输出为 WebP
 ```
 
 ## 视频压缩（macOS / iOS / Android / Windows）
@@ -193,5 +193,5 @@ std::fs::write("out.mp4", out)?;
 
 ## 备注
 
-- 本库图片压缩：Native 平台输出 WebP，Web/WASM 输出 JPEG（GIF 暂不支持）；视频压缩输出 H.264/MP4（macOS / iOS / Android / Windows，见下方「视频压缩」）。
+- 本库图片压缩统一输出 WebP（GIF 暂不支持）；视频压缩输出 H.264/MP4（macOS / iOS / Android / Windows，见下方「视频压缩」）。
 - 如需更稳定的“业务压缩率基线”，建议在你们真实样本集上固定 `quality` 进行批量评测并记录 P50/P90。

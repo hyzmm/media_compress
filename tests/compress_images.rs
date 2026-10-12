@@ -1,3 +1,7 @@
+// Native-only integration tests: they read fixtures from test_images/ and use
+// the `webp` crate, neither of which exists on the wasm32 target.
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
