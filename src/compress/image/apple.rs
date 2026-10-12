@@ -54,6 +54,12 @@ const BITMAP_INFO: u32 = 0x2002;
 
 /// CFNumberType: kCFNumberSInt32Type = 3
 const CF_NUMBER_SINT32_TYPE: i32 = 3;
+
+/// CFNumberType: kCFNumberFloat64Type = 13
+const CF_NUMBER_FLOAT64_TYPE: i32 = 13;
+
+/// Fallback frame delay when the source carries no delay metadata.
+const DEFAULT_DELAY_MS: i32 = 100;
 // ---------------------------------------------------------------------------
 // FFI — CoreFoundation
 // ---------------------------------------------------------------------------
@@ -92,6 +98,9 @@ extern "C" {
     ) -> CFDictionaryRef;
 
     static kCGImagePropertyOrientation: CFStringRef;
+
+    static kCGImagePropertyGIFDictionary: CFStringRef;
+    static kCGImagePropertyGIFDelayTime: CFStringRef;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,20 +245,74 @@ unsafe fn encode_first_frame_to_webp(
     super::webp_encode::encode_static(&resized, target_w, target_h, options.quality)
 }
 
+/// Read the GIF frame delay (kCGImagePropertyGIFDelayTime, in seconds) for the
+/// frame at `index`, converted to milliseconds. Returns `DEFAULT_DELAY_MS`
+/// when the metadata is absent or unreadable.
+unsafe fn get_gif_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
+    let props = CGImageSourceCopyPropertiesAtIndex(src, index, std::ptr::null());
+    if props.is_null() {
+        return DEFAULT_DELAY_MS;
+    }
+
+    let gif_dict =
+        CFDictionaryGetValue(props, kCGImagePropertyGIFDictionary as CFTypeRef) as CFDictionaryRef;
+    if gif_dict.is_null() {
+        CFRelease(props as CFTypeRef);
+        return DEFAULT_DELAY_MS;
+    }
+
+    let delay_val = CFDictionaryGetValue(gif_dict, kCGImagePropertyGIFDelayTime as CFTypeRef);
+    if delay_val.is_null() {
+        CFRelease(props as CFTypeRef);
+        return DEFAULT_DELAY_MS;
+    }
+
+    let mut secs: f64 = 0.0;
+    CFNumberGetValue(
+        delay_val as CFNumberRef,
+        CF_NUMBER_FLOAT64_TYPE,
+        &mut secs as *mut f64 as *mut c_void,
+    );
+
+    CFRelease(props as CFTypeRef);
+
+    // GIF delays are stored as centiseconds; `secs * 1000` can land a hair
+    // below the exact millisecond value in f64 (e.g. 0.201 * 1000 =
+    // 200.99999...), so round instead of truncating to keep delays exact.
+    (secs * 1000.0).round() as i32
+}
+
+/// Encode all frames of an animated GIF source into an animated WebP.
+/// Per-frame delays are taken from the source as-is (no clamping, no merging).
+unsafe fn encode_gif_animated(
+    src: CGImageSourceRef,
+    count: usize,
+    options: CompressOptions,
+) -> Result<Vec<u8>, Error> {
+    // Dimensions come from the first frame, which is also frame 0's data.
+    let (first_pixels, w, h) = decode_frame(src, 0)?;
+    let (target_w, target_h) =
+        compute_target_dimensions(w, h, options.min_width, options.min_height);
+
+    let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::with_capacity(count);
+    let first_resized = resize::resize_rgba_nearest(&first_pixels, w, h, target_w, target_h);
+    frame_data.push((first_resized, get_gif_delay_ms(src, 0)));
+
+    for i in 1..count {
+        let (pixels, _, _) = decode_frame(src, i)?;
+        let delay = get_gif_delay_ms(src, i);
+        let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
+        frame_data.push((resized, delay));
+    }
+
+    super::webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
-    if matches!(
-        crate::compress::image::ImageFormat::detect(input),
-        Some(crate::compress::image::ImageFormat::Gif)
-    ) {
-        return Err(Error::UnsupportedFormat(
-            "GIF compression is not supported".into(),
-        ));
-    }
-
     unsafe {
         // Wrap raw bytes in a CFData — no copy, no allocator (null = default).
         let data_ref = CFDataCreate(std::ptr::null(), input.as_ptr(), input.len() as CFIndex);
@@ -272,11 +335,19 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             return Err(Error::DecodeError("Image source has no frames".into()));
         }
 
+        let input_is_gif = matches!(
+            crate::compress::image::ImageFormat::detect(input),
+            Some(crate::compress::image::ImageFormat::Gif)
+        );
+
         let result = if count == 1 {
             // Static image -> WebP.
             encode_first_frame_to_webp(src, options)
+        } else if input_is_gif {
+            // Animated GIF -> animated WebP, per-frame delays preserved as-is.
+            encode_gif_animated(src, count, options)
         } else {
-            // Animated non-GIF -> WebP poster frame.
+            // Other animated formats (animated WebP, APNG) -> WebP poster frame.
             encode_first_frame_to_webp(src, options)
         };
 

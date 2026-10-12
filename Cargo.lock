@@ -415,6 +415,7 @@ dependencies = [
  "image",
  "jni",
  "js-sys",
+ "libwebp-sys",
  "ndk-context",
  "thiserror 2.0.18",
  "wasm-bindgen",

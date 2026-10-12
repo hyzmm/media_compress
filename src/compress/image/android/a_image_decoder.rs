@@ -154,12 +154,6 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
 // ---------------------------------------------------------------------------
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
-    if matches!(ImageFormat::detect(input), Some(ImageFormat::Gif)) {
-        return Err(Error::UnsupportedFormat(
-            "GIF compression is not supported".into(),
-        ));
-    }
-
     let api = match api() {
         Some(a) => a,
         None => {
@@ -223,9 +217,11 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
         let mut buf = vec![0u8; buf_size];
 
         // ── Animated or static? ────────────────────────────────────────────
-        // AImageDecoder_isAnimated requires API 31+.
+        // AImageDecoder_isAnimated requires API 31+. Only GIFs take the
+        // animated path; other animated formats keep the poster-frame path.
+        let input_is_gif = matches!(ImageFormat::detect(input), Some(ImageFormat::Gif));
         let animated = match api.AImageDecoder_isAnimated {
-            Some(is_anim) => is_anim(dec) != 0,
+            Some(is_anim) => is_anim(dec) != 0 && input_is_gif,
             None => false,
         };
 
@@ -256,29 +252,74 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
             webp_encode::encode_static(&resized, target_w, target_h, options.quality)
         } else {
-            // For non-GIF animations, export a WebP poster frame.
-            let ret = (api.AImageDecoder_decodeImage)(
-                dec,
-                buf.as_mut_ptr() as *mut c_void,
-                stride,
-                buf_size,
-            );
-            if ret != ANDROID_IMAGE_DECODER_SUCCESS {
+            // ── Animated GIF → animated WebP ────────────────────────────────
+            // Animation helpers require API 31+; if absent, return error so
+            // the caller can fall back to JNI BitmapFactory (static only).
+            if api.AImageDecoder_advanceFrame.is_none()
+                || api.AImageDecoderFrameInfo_create.is_none()
+                || api.AImageDecoderFrameInfo_getDuration.is_none()
+                || api.AImageDecoderFrameInfo_delete.is_none()
+            {
                 (api.AImageDecoder_delete)(dec);
-                if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
-                    return Err(Error::PlatformNotSupported(
-                        "format not supported by AImageDecoder on this device".into(),
-                    ));
+                return Err(Error::PlatformNotSupported(
+                    "AImageDecoder animation functions not available on this device".into(),
+                ));
+            }
+            let advance_frame = api.AImageDecoder_advanceFrame.unwrap();
+            let frame_info_create = api.AImageDecoderFrameInfo_create.unwrap();
+            let frame_info_gd = api.AImageDecoderFrameInfo_getDuration.unwrap();
+            let frame_info_delete = api.AImageDecoderFrameInfo_delete.unwrap();
+
+            let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::new();
+            let mut is_first = true;
+
+            loop {
+                let ret = (api.AImageDecoder_decodeImage)(
+                    dec,
+                    buf.as_mut_ptr() as *mut c_void,
+                    stride,
+                    buf_size,
+                );
+                if ret != ANDROID_IMAGE_DECODER_SUCCESS {
+                    if is_first {
+                        (api.AImageDecoder_delete)(dec);
+                        if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
+                            return Err(Error::PlatformNotSupported(
+                                "format not supported by AImageDecoder on this device".into(),
+                            ));
+                        }
+                        return Err(Error::DecodeError(format!(
+                            "AImageDecoder_decodeImage failed on frame 0: {}",
+                            ret
+                        )));
+                    }
+                    break;
                 }
-                return Err(Error::DecodeError(format!(
-                    "AImageDecoder_decodeImage failed on poster frame: {}",
-                    ret
-                )));
+                is_first = false;
+
+                let rgba = compact_rgba(&buf, w, h, stride);
+                let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
+
+                // Read frame duration before advancing
+                let fi = frame_info_create(dec);
+                let delay_ms = if fi.is_null() {
+                    DEFAULT_DELAY_MS
+                } else {
+                    let ns = frame_info_gd(fi);
+                    frame_info_delete(fi);
+                    // Convert ns → ms as-is, no clamping
+                    (ns / 1_000_000) as i32
+                };
+
+                frame_data.push((resized, delay_ms));
+
+                let adv = advance_frame(dec);
+                if adv != ANDROID_IMAGE_DECODER_SUCCESS {
+                    break;
+                }
             }
 
-            let rgba = compact_rgba(&buf, w, h, stride);
-            let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
-            webp_encode::encode_static(&resized, target_w, target_h, options.quality)
+            webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
         };
 
         (api.AImageDecoder_delete)(dec);

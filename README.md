@@ -1,6 +1,6 @@
 # media_compress
 
-跨平台图片/视频压缩库（Rust）。图片：非 GIF 输入统一输出为有损 WebP（Native 与 Web/WASM 一致）；GIF 暂不支持；视频：输出 H.264 + MP4（AAC 音频）。
+跨平台图片/视频压缩库（Rust）。图片：统一输出为有损 WebP——多帧 GIF 输出动画 WebP（帧延迟原样保留；Web 端在 `web-zenwebp` 构建下），其他动图输出首帧；视频：输出 H.264 + MP4（AAC 音频）。
 
 ## 实现方案
 
@@ -9,8 +9,8 @@
 - 入口 API：`compress_image(input, options)`
 - Web 专用异步 API：`compress_image_js(input, quality, min_width?, min_height?)`
 - 编码目标：
-    - Native 平台：非 GIF 统一编码为 WebP
-    - Web/WASM：`OffscreenCanvas.convertToBlob` 输出 `image/webp`
+    - Native 平台：统一编码为 WebP；多帧 GIF 编码为动画 WebP（帧延迟按源原样保留，不合并、不调整）
+    - Web/WASM：默认构建用 `OffscreenCanvas.convertToBlob` 输出 `image/webp`（动图出首帧）；`web-zenwebp` 构建下多帧 GIF 经浏览器 WebCodecs `ImageDecoder` 解帧后由 zenwebp 编码为动画 WebP
 - 格式识别：通过文件魔数自动检测（JPEG/PNG/GIF/BMP/WebP/TIFF/HEIC）
 - 结果保护：对可能已较优压缩的输入（WebP/JPEG/PNG/GIF），若压缩后更大则返回原图字节
 
@@ -39,8 +39,8 @@
 - 质量参数：`quality` 取值 0-100（常用 75）
 - 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
 - Native 编码配置：有损 WebP + 多线程
-- GIF：暂不支持（`compress_image` 返回 `UnsupportedFormat`）
-- 动图处理：非 GIF 动图输入导出 WebP 首帧（poster frame）
+- GIF：多帧 GIF 输出动画 WebP，帧延迟按源原样保留（不合并、不调整）；单帧 GIF 输出静止 WebP；Android API < 31 因系统动画解码接口缺失，GIF 出首帧
+- 动图处理：非 GIF 动图（动画 WebP / APNG）输入导出 WebP 首帧（poster frame）
 
 ## 各平台图片格式支持情况
 
@@ -48,11 +48,15 @@
 
 | 平台                             | 输入格式支持                                                                 | 输出格式                  |
 | -------------------------------- | ---------------------------------------------------------------------------- | ------------------------- |
-| macOS / iOS                      | JPEG, PNG, BMP, WebP, HEIC, TIFF                                             | WebP                      |
-| Windows                          | JPEG, PNG, BMP, WebP, TIFF（WIC 能力范围内）                                 | WebP                      |
-| Android (API 28+, AImageDecoder) | JPEG, PNG, BMP, WebP，及设备支持的其他系统解码格式（如部分 HEIF/AVIF）       | WebP                      |
-| Android (API < 28 或回退 JNI)    | JPEG, PNG, BMP, WebP（HEIC/TIFF 不支持）                                     | WebP                      |
-| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器） | WebP                      |
+| macOS / iOS                      | JPEG, PNG, GIF（多帧→动画 WebP）, BMP, WebP, HEIC, TIFF                      | WebP / 动画 WebP          |
+| Windows                          | JPEG, PNG, GIF（多帧→动画 WebP，WIC 能力范围内）, BMP, WebP, TIFF            | WebP / 动画 WebP          |
+| Android (API 31+, AImageDecoder) | JPEG, PNG, GIF（多帧→动画 WebP）, BMP, WebP，及设备支持的其他系统解码格式    | WebP / 动画 WebP          |
+| Android (API < 31 或回退 JNI)    | JPEG, PNG, GIF（首帧）, BMP, WebP（HEIC/TIFF 不支持）                        | WebP                      |
+| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器）；GIF 动画见下 | WebP（`web-zenwebp` 构建下 GIF 可输出动画 WebP） |
+
+Web 端 GIF：
+- 默认 canvas 构建：输出首帧静止 WebP；
+- `web-zenwebp` 构建：浏览器支持 WebCodecs `ImageDecoder`（Chrome 94+ / Safari 16.4+ / Firefox 133+）时输出动画 WebP（帧延迟原样保留），否则回退首帧。
 
 ## 大概压缩率数据（样本实测）
 
@@ -136,6 +140,7 @@ import init, { compress_image_js } from './pkg/media_compress.js';
 await init();
 const out = await compress_image_js(inputBytes, 75, 1280, 720);
 // out 是 Uint8Array，输出为 WebP
+// （web-zenwebp 构建 + 浏览器支持 ImageDecoder 时，GIF 输入输出动画 WebP）
 ```
 
 ## 视频压缩（macOS / iOS / Android / Windows）
@@ -166,7 +171,7 @@ std::fs::write("out.mp4", out)?;
 
 ### 主链路：AImageDecoder（API 30+）
 
-- **动画支持**：支持系统可解码的多帧格式（如 GIF）
+- **动画支持**：多帧 GIF 输出动画 WebP（帧延迟原样保留；系统动画接口需 API 31+，API 30 上 GIF 出首帧）；其余多帧格式输出首帧
 - **API 兼容性**：动态加载以支持低版本 Android 系统
 
 ### 回退链路：JNI BitmapFactory（API < 28）
@@ -193,5 +198,5 @@ std::fs::write("out.mp4", out)?;
 
 ## 备注
 
-- 本库图片压缩统一输出 WebP（GIF 暂不支持）；视频压缩输出 H.264/MP4（macOS / iOS / Android / Windows，见下方「视频压缩」）。
+- 本库图片压缩统一输出 WebP（多帧 GIF 输出动画 WebP，帧延迟原样保留；其余动图取首帧）；视频压缩输出 H.264/MP4（macOS / iOS / Android / Windows，见下方「视频压缩」）。
 - 如需更稳定的“业务压缩率基线”，建议在你们真实样本集上固定 `quality` 进行批量评测并记录 P50/P90。

@@ -13,10 +13,6 @@ fn is_webp(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[8..12] == b"WEBP"
 }
 
-fn is_gif(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
-}
-
 fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let features = BitstreamFeatures::new(bytes)?;
     Some((features.width(), features.height()))
@@ -60,23 +56,30 @@ fn compress_with_min_1080_dimensions() {
 }
 
 #[test]
-fn compress_test_image_gif_is_unsupported() {
+fn compress_test_image_gif_to_animated_webp() {
     let input = include_bytes!("../test_images/test_image.gif");
 
     let mut options = CompressOptions::new(75.0);
     options.min_width = Some(1080);
     options.min_height = Some(1080);
 
-    let err = compress_image(input, options).expect_err("GIF input should return an error");
-    match err {
-        media_compress::Error::UnsupportedFormat(msg) => {
-            assert!(
-                msg.contains("GIF compression is not supported"),
-                "unexpected unsupported message: {msg}"
-            );
-        }
-        other => panic!("expected UnsupportedFormat for GIF input, got {other}"),
-    }
+    let out = compress_image(input, options).expect("compress_image failed for GIF input");
+    assert!(is_webp(&out), "expected WebP output for GIF input");
+
+    let features = BitstreamFeatures::new(&out).expect("failed to parse output WebP");
+    assert!(
+        features.has_animation(),
+        "expected animated WebP (ANIM chunk) for animated GIF input"
+    );
+
+    let anim = webp::AnimDecoder::new(&out)
+        .decode()
+        .expect("failed to decode output animation");
+    assert!(
+        anim.len() >= 2,
+        "expected multiple frames in output, got {}",
+        anim.len()
+    );
 }
 
 #[test]
@@ -237,12 +240,6 @@ fn compress_all_test_images() {
             }
             Err(media_compress::Error::PlatformNotSupported(msg)) => {
                 eprintln!("  SKIP  {} — platform not supported: {}", file_name, msg);
-                skipped += 1;
-            }
-            Err(media_compress::Error::UnsupportedFormat(msg))
-                if is_gif(&data) && msg.contains("GIF compression is not supported") =>
-            {
-                eprintln!("  SKIP  {} — GIF compression disabled: {}", file_name, msg);
                 skipped += 1;
             }
             Err(e) => {

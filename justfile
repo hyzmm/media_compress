@@ -15,6 +15,8 @@ test_web_chrome_zenwebp:
     # Same browser tests with the pure-Rust zenwebp encoder (wasm ~+419 KiB).
     # --features must come before `--` (args after `--` go to the wasm-bindgen
     # test runner); --release because debug wasm zenwebp encoding is very slow.
+    # The GIF test asserts an animated WebP (ANIM chunk), which requires a
+    # browser with the WebCodecs ImageDecoder API (Chrome) — hence Chrome here.
     PATH=$PATH:~/bin wasm-pack test --release --headless --chrome --test compress_images_wasm_browser --features web-zenwebp -- --nocapture
 
 test_ios:
@@ -36,13 +38,14 @@ test_android_31:
     cargo dinghy --platform auto-android-aarch64-api31 test --test compress_images -- compress_all_test_images --nocapture
 
 test_desktop:
-    cargo test --test compress_images -- compress_all_test_images --nocapture
+    cargo test --test compress_images -- --nocapture
 
 test_all:
     just test_web_chrome
     just test_web_safari
     just test_ios
-    just test_android
+    just test_android_24
+    just test_android_31
     just test_desktop
 
 build_android:
