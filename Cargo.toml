@@ -61,7 +61,8 @@ image = { version = "0.25", default-features = false, features = [
 wasm-bindgen-test = "0.3"
 web-sys = { version = "0.3", features = ["console"] }
 
-# Compile libwebp C sources with optimizations even in debug builds.
-# Without this, libwebp runs at -O0 and is ~20x slower than release.
-[profile.dev.package.libwebp-sys]
+# Optimize even in debug builds: compression time is dominated by pixel loops
+# in this crate (resize / EXIF orientation / BGRA->RGBA) and by the libwebp C
+# sources, all far slower at opt-level 0 / -O0. Debug info is unaffected.
+[profile.dev]
 opt-level = 2
