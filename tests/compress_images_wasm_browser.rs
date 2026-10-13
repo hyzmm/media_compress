@@ -7,6 +7,7 @@
 //! - `web-zenwebp` build: GIFs are encoded as animated WebP (frames and
 //!   delays extracted with the browser's WebCodecs `ImageDecoder`, encoded
 //!   with zenwebp); other inputs are static WebP.
+//! - WebP input is rejected before any browser API is touched.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -20,6 +21,7 @@ static JPEG_BYTES: &[u8] = include_bytes!("../test_images/portrait_2.jpg");
 static PNG_BYTES: &[u8] = include_bytes!("../test_images/test_image.png");
 static GIF_BYTES: &[u8] = include_bytes!("../test_images/test_image.gif");
 static BMP_BYTES: &[u8] = include_bytes!("../test_images/test_image.bmp");
+static WEBP_BYTES: &[u8] = include_bytes!("../test_images/test_image.webp");
 
 fn is_webp(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[8..12] == b"WEBP"
@@ -113,6 +115,15 @@ async fn compress_bmp_to_webp() -> Result<(), JsValue> {
     let bytes = compress_and_log("BMP  q=75", BMP_BYTES, 75.0).await?;
     assert!(is_webp(&bytes), "output is not WebP");
     Ok(())
+}
+
+#[wasm_bindgen_test]
+async fn compress_webp_input_is_rejected() {
+    let err = compress_image_js(WEBP_BYTES, 75.0, None, None)
+        .await
+        .expect_err("WebP input should be rejected");
+    let msg = err.as_string().unwrap_or_default();
+    assert!(msg.contains("WebP"), "unexpected error message: {msg}");
 }
 
 #[wasm_bindgen_test]

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use media_compress::{compress_image, CompressOptions};
+use media_compress::{compress_image, CompressOptions, ImageFormat};
 use webp::BitstreamFeatures;
 
 fn is_webp(bytes: &[u8]) -> bool {
@@ -83,6 +83,18 @@ fn compress_test_image_gif_to_animated_webp() {
 }
 
 #[test]
+fn compress_webp_input_is_rejected() {
+    let input = include_bytes!("../test_images/test_image.webp");
+
+    match compress_image(input, CompressOptions::new(75.0)) {
+        Err(media_compress::Error::UnsupportedFormat(msg)) => {
+            assert!(msg.contains("WebP"), "unexpected error message: {msg}");
+        }
+        other => panic!("expected UnsupportedFormat error for WebP input, got {other:?}"),
+    }
+}
+
+#[test]
 fn compress_exif_rotate_90_jpg_to_out_images() {
     let base_dir = {
         let compile_time = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -136,8 +148,9 @@ fn compress_exif_rotate_90_jpg_to_out_images() {
 /// Integration test: compress every supported file under `test_images/` to WebP and
 /// write results to `out_images/`.
 ///
-/// Unsupported or unrecognised formats are silently skipped.
-/// The test only fails if a *recognised* format fails to compress.
+/// Unrecognised formats are silently skipped, and WebP input is expected to be
+/// rejected (`UnsupportedFormat`). The test only fails if a *recognised* format
+/// fails to compress.
 #[test]
 fn compress_all_test_images() {
     // On host / iOS simulator: CARGO_MANIFEST_DIR (compile-time) points to the
@@ -237,6 +250,12 @@ fn compress_all_test_images() {
                     out_path.file_name().unwrap().to_string_lossy()
                 );
                 compressed += 1;
+            }
+            Err(media_compress::Error::UnsupportedFormat(msg))
+                if ImageFormat::detect(&data) == Some(ImageFormat::Webp) =>
+            {
+                eprintln!("  SKIP  {} — WebP input rejected: {}", file_name, msg);
+                skipped += 1;
             }
             Err(media_compress::Error::PlatformNotSupported(msg)) => {
                 eprintln!("  SKIP  {} — platform not supported: {}", file_name, msg);

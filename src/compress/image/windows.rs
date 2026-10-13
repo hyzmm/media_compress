@@ -617,7 +617,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
 
             webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
         } else {
-            // ── Other animated images (animated WebP, APNG) ────────────────
+            // ── Other multi-frame images (APNG, multi-page TIFF) ───────────
             // Export a WebP poster frame from the first decoded frame.
             let mut frame0: *mut c_void = std::ptr::null_mut();
             let hr: HRESULT = com_call!(

@@ -1,6 +1,7 @@
 use crate::compress::image::compute_target_dimensions;
 use crate::compress::image::CompressOptions;
 use crate::compress::image::ImageFormat;
+use crate::compress::image::WEBP_INPUT_REJECTED;
 use crate::error::Error;
 use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
@@ -15,7 +16,7 @@ use web_sys::{ImageBitmapRenderingContext, ImageEncodeOptions};
 const DEFAULT_DELAY_MS: i32 = 100;
 
 /// Decode raw image bytes with the browser-native `createImageBitmap`
-/// (JPEG, PNG, GIF, BMP, WebP, AVIF — varies by browser). For animated
+/// (JPEG, PNG, GIF, BMP, AVIF — varies by browser). For animated
 /// inputs this yields the first frame only.
 ///
 /// Resolved off the global object rather than `window` so the same code also
@@ -291,8 +292,9 @@ async fn encode_gif_animated_zenwebp(
 
 /// Compress raw image bytes to lossy WebP on the WASM/Web platform.
 ///
-/// Decoding is browser-native via `createImageBitmap` (supports JPEG, PNG,
-/// GIF, BMP, WebP, AVIF — varies by browser). Encoding goes through
+/// WebP input is rejected — it already is the output format. Decoding is
+/// browser-native via `createImageBitmap` (supports JPEG, PNG, GIF, BMP,
+/// AVIF — varies by browser). Encoding goes through
 /// `OffscreenCanvas.convertToBlob` by default, or through the pure-Rust
 /// `zenwebp` encoder when built with `--features web-zenwebp`.
 ///
@@ -300,7 +302,7 @@ async fn encode_gif_animated_zenwebp(
 /// when built with `--features web-zenwebp` and the browser provides the
 /// WebCodecs `ImageDecoder` API; otherwise (default canvas build, or no
 /// ImageDecoder) they are compressed to a static WebP poster frame. Other
-/// animated formats (animated WebP, APNG) always use the poster frame.
+/// animated formats (APNG) always use the poster frame.
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image
@@ -322,6 +324,9 @@ pub async fn compress_image_js(
     min_height: Option<u32>,
 ) -> Result<Uint8Array, JsValue> {
     let detected = ImageFormat::detect(input);
+    if detected == Some(ImageFormat::Webp) {
+        return Err(JsValue::from_str(WEBP_INPUT_REJECTED));
+    }
     let may_fallback = detected
         .as_ref()
         .map_or(false, |fmt| fmt.should_use_original_if_larger());

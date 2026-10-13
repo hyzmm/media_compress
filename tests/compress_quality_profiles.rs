@@ -99,6 +99,11 @@ fn compare_quality_profiles() {
             None => continue,
         };
 
+        // WebP input is already the output format, so compress_image rejects it.
+        if format == ImageFormat::Webp {
+            continue;
+        }
+
         let key = format_label(&format).to_string();
         let format_aggs = per_format_aggs
             .entry(key)

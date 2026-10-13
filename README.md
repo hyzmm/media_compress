@@ -12,7 +12,8 @@
     - Native 平台：统一编码为 WebP；多帧 GIF 编码为动画 WebP（帧延迟按源原样保留，不合并、不调整）
     - Web/WASM：默认构建用 `OffscreenCanvas.convertToBlob` 输出 `image/webp`（动图出首帧）；`web-zenwebp` 构建下多帧 GIF 经浏览器 WebCodecs `ImageDecoder` 解帧后由 zenwebp 编码为动画 WebP
 - 格式识别：通过文件魔数自动检测（JPEG/PNG/GIF/BMP/WebP/TIFF/HEIC）
-- 结果保护：对可能已较优压缩的输入（WebP/JPEG/PNG/GIF），若压缩后更大则返回原图字节
+- WebP 输入：直接报错（`UnsupportedFormat`），不做重编码——WebP 已是本库输出格式，二次有损重编只会掉画质
+- 结果保护：对可能已较优压缩的输入（JPEG/PNG/GIF），若压缩后更大则返回原图字节
 
 ### 2. 平台解码与编码路径
 
@@ -40,7 +41,7 @@
 - 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
 - Native 编码配置：有损 WebP + 多线程
 - GIF：多帧 GIF 输出动画 WebP，帧延迟按源原样保留（不合并、不调整）；单帧 GIF 输出静止 WebP；Android API < 31 因系统动画解码接口缺失，GIF 出首帧
-- 动图处理：非 GIF 动图（动画 WebP / APNG）输入导出 WebP 首帧（poster frame）
+- 动图处理：非 GIF 动图（APNG）输入导出 WebP 首帧（poster frame）
 
 ## 各平台图片格式支持情况
 
@@ -48,11 +49,13 @@
 
 | 平台                             | 输入格式支持                                                                 | 输出格式                  |
 | -------------------------------- | ---------------------------------------------------------------------------- | ------------------------- |
-| macOS / iOS                      | JPEG, PNG, GIF（多帧→动画 WebP）, BMP, WebP, HEIC, TIFF                      | WebP / 动画 WebP          |
-| Windows                          | JPEG, PNG, GIF（多帧→动画 WebP，WIC 能力范围内）, BMP, WebP, TIFF            | WebP / 动画 WebP          |
-| Android (API 31+, AImageDecoder) | JPEG, PNG, GIF（多帧→动画 WebP）, BMP, WebP，及设备支持的其他系统解码格式    | WebP / 动画 WebP          |
-| Android (API < 31 或回退 JNI)    | JPEG, PNG, GIF（首帧）, BMP, WebP（HEIC/TIFF 不支持）                        | WebP                      |
-| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP/WebP（AVIF 等视浏览器）；GIF 动画见下 | WebP（`web-zenwebp` 构建下 GIF 可输出动画 WebP） |
+| macOS / iOS                      | JPEG, PNG, GIF（多帧→动画 WebP）, BMP, HEIC, TIFF                            | WebP / 动画 WebP          |
+| Windows                          | JPEG, PNG, GIF（多帧→动画 WebP，WIC 能力范围内）, BMP, TIFF                  | WebP / 动画 WebP          |
+| Android (API 31+, AImageDecoder) | JPEG, PNG, GIF（多帧→动画 WebP）, BMP，及设备支持的其他系统解码格式          | WebP / 动画 WebP          |
+| Android (API < 31 或回退 JNI)    | JPEG, PNG, GIF（首帧）, BMP（HEIC/TIFF 不支持）                              | WebP                      |
+| Web/WASM（浏览器）               | 由 `createImageBitmap` 决定，常见为 JPEG/PNG/GIF/BMP（AVIF 等视浏览器）；GIF 动画见下 | WebP（`web-zenwebp` 构建下 GIF 可输出动画 WebP） |
+
+WebP 输入不在上表之列：所有平台在魔数检测命中 WebP 后直接返回 `UnsupportedFormat` 错误，不进入解码/编码（原因见「总体架构」）。
 
 Web 端 GIF：
 - 默认 canvas 构建：输出首帧静止 WebP；
@@ -108,11 +111,12 @@ Web 端 GIF：
 数据解读：
 
 - 对 BMP、TIFF、PNG 这类源文件，压缩收益通常很高。
-- 对已压缩格式（JPEG/WebP），收益取决于原图质量与编码参数。
+- 对已压缩格式（JPEG），收益取决于原图质量与编码参数。
 - “加权节省率”受超大 BMP 样本影响明显，建议结合业务真实分布评估。
 - 在当前样本上，quality 越低压缩率越高，quality=50 相比 90 节省率提升明显。
 - 建议线上默认值从 75 起步，再按画质目标向 50 或 90 调整。
-- 对 JPEG/WebP 这类已压缩格式，q90 接近无收益；对 PNG/BMP/TIFF，q75 仍有较高节省率。
+- 对 JPEG 这类已压缩格式，q90 接近无收益；对 PNG/BMP/TIFF，q75 仍有较高节省率。
+- 本批数据采集于 WebP 输入仍会被压缩的旧版本；当前版本对 WebP 输入直接报错，上表中 WebP 行仅作历史参考。
 
 ## 快速使用
 

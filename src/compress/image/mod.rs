@@ -27,13 +27,15 @@ pub mod wasm;
 // Supported input image formats (used for format detection and error messages)
 // ---------------------------------------------------------------------------
 
-/// Supported input image formats.
+/// Input image formats recognised from magic bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImageFormat {
     Jpeg,
     Png,
     Gif,
     Bmp,
+    /// WebP — detected, but rejected as compression input: it already is the
+    /// format this library outputs.
     Webp,
     /// HEIC/HEIF — supported on iOS/macOS via ImageIO
     Heic,
@@ -71,12 +73,17 @@ impl ImageFormat {
     }
 
     /// Returns `true` if the format is one that may already be well-compressed
-    /// (WebP, JPEG, PNG, or GIF), meaning we should keep the original when the
+    /// (JPEG, PNG, or GIF), meaning we should keep the original when the
     /// compressed output turns out to be larger.
     pub fn should_use_original_if_larger(&self) -> bool {
-        matches!(self, Self::Webp | Self::Jpeg | Self::Png | Self::Gif)
+        matches!(self, Self::Jpeg | Self::Png | Self::Gif)
     }
 }
+
+/// Error text shared by the native and Web entry points when the input is
+/// already WebP. Re-encoding it would only add another lossy generation.
+pub(crate) const WEBP_INPUT_REJECTED: &str =
+    "WebP input is not supported (already the output format)";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -135,9 +142,11 @@ pub(crate) fn compute_target_dimensions(
 
 /// Compress an image to lossy WebP.
 ///
+/// WebP input is rejected with [`Error::UnsupportedFormat`]: it already is the
+/// output format, so re-encoding it would only add another lossy generation.
 /// Animated GIFs are decoded frame by frame and encoded as animated WebP with
-/// their original per-frame delays. Other animated formats (animated WebP,
-/// APNG) are reduced to their first frame.
+/// their original per-frame delays. Other animated formats (APNG) are reduced
+/// to their first frame.
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image (any supported format)
@@ -150,16 +159,20 @@ pub(crate) fn compute_target_dimensions(
 /// # Platform support
 /// | Platform | Formats                                   |
 /// |----------|-------------------------------------------|
-/// | macOS / iOS | JPEG, PNG, GIF (animated), BMP, HEIC, TIFF, WebP |
-/// | Android (API 24+) | JPEG, PNG, GIF (animated on API 31+), BMP, WebP, TIFF |
-/// | Windows  | JPEG, PNG, GIF (animated), BMP, TIFF, WebP          |
-/// | Web/WASM | not supported (decode on the JS side)     |
+/// | macOS / iOS | JPEG, PNG, GIF (animated), BMP, HEIC, TIFF |
+/// | Android (API 24+) | JPEG, PNG, GIF (animated on API 31+), BMP, TIFF |
+/// | Windows  | JPEG, PNG, GIF (animated), BMP, TIFF |
+/// | Web/WASM | not supported; use `compress_image_js` instead |
 pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     // Validate or detect format (used only for error messages if the platform
     // rejects the input; the native API handles actual format detection).
     let fmt = ImageFormat::detect(input).ok_or_else(|| {
         Error::UnsupportedFormat("Cannot detect image format from magic bytes".into())
     })?;
+
+    if fmt == ImageFormat::Webp {
+        return Err(Error::UnsupportedFormat(WEBP_INPUT_REJECTED.into()));
+    }
 
     // Whether the source format is one of the common lossy/lossless formats
     // that may already be well-compressed. If the output ends up larger than

@@ -347,7 +347,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             // Animated GIF -> animated WebP, per-frame delays preserved as-is.
             encode_gif_animated(src, count, options)
         } else {
-            // Other animated formats (animated WebP, APNG) -> WebP poster frame.
+            // Other animated formats (APNG) -> WebP poster frame.
             encode_first_frame_to_webp(src, options)
         };
 
