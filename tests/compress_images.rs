@@ -13,6 +13,25 @@ fn is_webp(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[8..12] == b"WEBP"
 }
 
+fn is_gif(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
+}
+
+/// Decode every frame as `(width, height, delay_cs)`.
+fn gif_frames(data: &[u8]) -> Vec<(u16, u16, u16)> {
+    let mut dec = zengif::Decoder::new(
+        std::io::Cursor::new(data),
+        zengif::Limits::default(),
+        &zengif::Unstoppable,
+    )
+    .expect("zengif decode failed");
+    let mut frames = Vec::new();
+    while let Some(f) = dec.next_frame().expect("zengif frame failed") {
+        frames.push((f.width, f.height, f.delay));
+    }
+    frames
+}
+
 fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let features = BitstreamFeatures::new(bytes)?;
     Some((features.width(), features.height()))
@@ -56,29 +75,28 @@ fn compress_with_min_1080_dimensions() {
 }
 
 #[test]
-fn compress_test_image_gif_to_animated_webp() {
+fn compress_test_image_gif_to_gif() {
     let input = include_bytes!("../test_images/test_image.gif");
 
     let mut options = CompressOptions::new(75.0);
-    options.min_width = Some(1080);
-    options.min_height = Some(1080);
+    options.min_width = Some(240);
 
     let out = compress_image(input, options).expect("compress_image failed for GIF input");
-    assert!(is_webp(&out), "expected WebP output for GIF input");
+    assert!(is_gif(&out), "expected GIF output for GIF input");
 
-    let features = BitstreamFeatures::new(&out).expect("failed to parse output WebP");
-    assert!(
-        features.has_animation(),
-        "expected animated WebP (ANIM chunk) for animated GIF input"
+    let src = gif_frames(input);
+    let dst = gif_frames(&out);
+    assert!(dst.len() >= 2, "expected multiple frames, got {}", dst.len());
+    assert_eq!(dst.len(), src.len(), "frame count must be preserved");
+    assert_eq!(
+        (dst[0].0, dst[0].1),
+        (240, 135),
+        "min_width should downscale GIF frames"
     );
-
-    let anim = webp::AnimDecoder::new(&out)
-        .decode()
-        .expect("failed to decode output animation");
-    assert!(
-        anim.len() >= 2,
-        "expected multiple frames in output, got {}",
-        anim.len()
+    assert_eq!(
+        dst.iter().map(|f| f.2).collect::<Vec<_>>(),
+        src.iter().map(|f| f.2).collect::<Vec<_>>(),
+        "frame delays must be preserved as-is"
     );
 }
 
@@ -145,8 +163,8 @@ fn compress_exif_rotate_90_jpg_to_out_images() {
         .unwrap_or_else(|e| panic!("cannot write {}: {}", out_path.display(), e));
 }
 
-/// Integration test: compress every supported file under `test_images/` to WebP and
-/// write results to `out_images/`.
+/// Integration test: compress every supported file under `test_images/` and
+/// write results to `out_images/` (GIF input → GIF, everything else → WebP).
 ///
 /// Unrecognised formats are silently skipped, and WebP input is expected to be
 /// rejected (`UnsupportedFormat`). The test only fails if a *recognised* format
@@ -213,38 +231,49 @@ fn compress_all_test_images() {
         let original_size = data.len();
         eprintln!("  COMPRESS  {}  size: {} bytes", file_name, original_size);
 
+        let expects_gif = ImageFormat::detect(&data) == Some(ImageFormat::Gif);
+
         let t0 = Instant::now();
         match compress_image(&data, CompressOptions::new(75.0)) {
-            Ok(webp_bytes) => {
+            Ok(bytes) => {
                 let elapsed = t0.elapsed();
                 assert!(
-                    !webp_bytes.is_empty(),
+                    !bytes.is_empty(),
                     "compress_image returned empty bytes for {}",
                     file_name
                 );
-                assert!(
-                    is_webp(&webp_bytes),
-                    "expected WebP output for {}",
-                    file_name
-                );
+                if expects_gif {
+                    assert!(
+                        is_gif(&bytes),
+                        "expected GIF output for {}",
+                        file_name
+                    );
+                } else {
+                    assert!(
+                        is_webp(&bytes),
+                        "expected WebP output for {}",
+                        file_name
+                    );
+                }
 
-                // Write output: append the original extension before .webp so
-                // files with the same stem (e.g. test_image.jpg / test_image.png)
-                // don't overwrite each other in out_images/.
+                // Write output: append the original extension before the output
+                // extension so files with the same stem (e.g. test_image.jpg /
+                // test_image.png) don't overwrite each other in out_images/.
                 let stem = path.file_stem().unwrap().to_string_lossy();
                 let orig_ext = path
                     .extension()
                     .map(|e| format!(".{}", e.to_string_lossy()))
                     .unwrap_or_default();
-                let out_name = format!("{}{}.webp", stem, orig_ext);
+                let out_ext = if is_gif(&bytes) { "gif" } else { "webp" };
+                let out_name = format!("{}{}.{}", stem, orig_ext, out_ext);
                 let out_path = output_dir.join(&out_name);
-                fs::write(&out_path, &webp_bytes)
+                fs::write(&out_path, &bytes)
                     .unwrap_or_else(|e| panic!("cannot write {}: {}", out_path.display(), e));
 
-                let ratio = webp_bytes.len() as f64 / original_size as f64 * 100.0;
+                let ratio = bytes.len() as f64 / original_size as f64 * 100.0;
                 println!(
                     "    -> {} bytes ({:.1}% of original)  time: {:.2?}  saved to {}",
-                    webp_bytes.len(),
+                    bytes.len(),
                     ratio,
                     elapsed,
                     out_path.file_name().unwrap().to_string_lossy()

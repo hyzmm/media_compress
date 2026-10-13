@@ -2,11 +2,10 @@
 //!   wasm-pack test --headless --chrome --test compress_images_wasm_browser
 //!
 //! These tests exercise `compress_image_js`:
-//! - Default canvas build: every input (GIF included, first frame only) is
-//!   encoded as static WebP via `createImageBitmap` + `OffscreenCanvas`.
-//! - `web-zenwebp` build: GIFs are encoded as animated WebP (frames and
-//!   delays extracted with the browser's WebCodecs `ImageDecoder`, encoded
-//!   with zenwebp); other inputs are static WebP.
+//! - GIF input is decoded and re-encoded as GIF by the shared zengif codec
+//!   (per-frame delays preserved), identically to the native platforms.
+//! - Every other input is encoded as static WebP via `createImageBitmap` +
+//!   `OffscreenCanvas`.
 //! - WebP input is rejected before any browser API is touched.
 
 #![cfg(target_arch = "wasm32")]
@@ -29,25 +28,6 @@ fn is_webp(bytes: &[u8]) -> bool {
 
 fn is_gif(bytes: &[u8]) -> bool {
     bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
-}
-
-/// Walk the RIFF chunks of a WebP file looking for the "ANIM" chunk
-/// (present only in animated WebP). Only used by the web-zenwebp build.
-#[cfg(feature = "web-zenwebp")]
-fn has_anim_chunk(bytes: &[u8]) -> bool {
-    if !is_webp(bytes) {
-        return false;
-    }
-    let mut pos = 12usize;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        if id == b"ANIM" {
-            return true;
-        }
-        pos += 8 + size + (size & 1);
-    }
-    false
 }
 
 fn detect_format(bytes: &[u8]) -> &'static str {
@@ -95,17 +75,12 @@ async fn compress_png_to_webp() -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen_test]
-async fn compress_gif_to_webp() -> Result<(), JsValue> {
+async fn compress_gif_to_gif() -> Result<(), JsValue> {
     let bytes = compress_and_log("GIF  q=75", GIF_BYTES, 75.0).await?;
-    assert!(is_webp(&bytes), "output is not WebP");
-
-    // The web-zenwebp build emits an animated WebP when the browser provides
-    // the WebCodecs ImageDecoder API (Chrome); the default canvas build
-    // always emits a static poster frame.
-    #[cfg(feature = "web-zenwebp")]
     assert!(
-        has_anim_chunk(&bytes),
-        "expected animated WebP (ANIM chunk) for GIF input in the web-zenwebp build"
+        is_gif(&bytes),
+        "expected GIF output for GIF input (first 12 bytes: {:?})",
+        &bytes[..12.min(bytes.len())]
     );
     Ok(())
 }

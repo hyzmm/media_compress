@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use crate::compress::image::resize;
 use crate::compress::image::webp_encode;
-use crate::compress::image::{compute_target_dimensions, CompressOptions, ImageFormat};
+use crate::compress::image::{compute_target_dimensions, CompressOptions};
 use crate::error::Error;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -20,11 +20,6 @@ struct AImageDecoderHeaderInfo {
     _private: [u8; 0],
 }
 
-#[repr(C)]
-struct AImageDecoderFrameInfo {
-    _private: [u8; 0],
-}
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -32,15 +27,11 @@ struct AImageDecoderFrameInfo {
 const ANDROID_BITMAP_FORMAT_RGBA_8888: i32 = 1;
 const ANDROID_IMAGE_DECODER_SUCCESS: i32 = 0;
 const ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT: i32 = -6;
-const DEFAULT_DELAY_MS: i32 = 100;
 
 // ---------------------------------------------------------------------------
 // Dynamic loading — AImageDecoder lives in libjnigraphics.so (API 30+).
 // Using dlopen/dlsym so the binary can still load on API < 30 devices
 // (where the symbols are absent); those devices fall back to JNI BitmapFactory.
-//
-// Animation helpers (AImageDecoder_isAnimated etc.) require API 31+, so they
-// are loaded as Option and treated as absent when missing.
 // ---------------------------------------------------------------------------
 
 const RTLD_NOW: i32 = 2;
@@ -63,17 +54,9 @@ type HeaderGetHeightFn = unsafe extern "C" fn(*const AImageDecoderHeaderInfo) ->
 type SetBitmapFormatFn = unsafe extern "C" fn(*mut AImageDecoder, i32) -> i32;
 type GetMinimumStrideFn = unsafe extern "C" fn(*mut AImageDecoder) -> usize;
 type DecodeImageFn = unsafe extern "C" fn(*mut AImageDecoder, *mut c_void, usize, usize) -> i32;
-type IsAnimatedFn = unsafe extern "C" fn(*mut AImageDecoder) -> i32;
-type AdvanceFrameFn = unsafe extern "C" fn(*mut AImageDecoder) -> i32;
-type FrameInfoCreateFn = unsafe extern "C" fn() -> *mut AImageDecoderFrameInfo;
-type FrameInfoGetInfoFn =
-    unsafe extern "C" fn(*mut AImageDecoder, *mut AImageDecoderFrameInfo) -> i32;
-type FrameInfoGetDurationFn = unsafe extern "C" fn(*const AImageDecoderFrameInfo) -> i64;
-type FrameInfoDeleteFn = unsafe extern "C" fn(*mut AImageDecoderFrameInfo);
 
 #[allow(non_snake_case)]
 struct Api {
-    // Core decode functions — present on API 30+
     AImageDecoder_createFromBuffer: CreateFromBufferFn,
     AImageDecoder_delete: DeleteFn,
     AImageDecoder_getHeaderInfo: GetHeaderInfoFn,
@@ -82,13 +65,6 @@ struct Api {
     AImageDecoder_setAndroidBitmapFormat: SetBitmapFormatFn,
     AImageDecoder_getMinimumStride: GetMinimumStrideFn,
     AImageDecoder_decodeImage: DecodeImageFn,
-    // Animation helpers — present on API 31+ only
-    AImageDecoder_isAnimated: Option<IsAnimatedFn>,
-    AImageDecoder_advanceFrame: Option<AdvanceFrameFn>,
-    AImageDecoder_getFrameInfo: Option<FrameInfoGetInfoFn>,
-    AImageDecoderFrameInfo_create: Option<FrameInfoCreateFn>,
-    AImageDecoderFrameInfo_getDuration: Option<FrameInfoGetDurationFn>,
-    AImageDecoderFrameInfo_delete: Option<FrameInfoDeleteFn>,
 }
 
 unsafe impl Send for Api {}
@@ -123,16 +99,6 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
                 std::mem::transmute::<*mut c_void, _>(ptr)
             }};
         }
-        macro_rules! load_opt {
-            ($name:expr) => {{
-                let ptr = dlsym(handle, concat!($name, "\0").as_ptr() as *const c_char);
-                if ptr.is_null() {
-                    None
-                } else {
-                    Some(std::mem::transmute::<*mut c_void, _>(ptr))
-                }
-            }};
-        }
 
         Some(Api {
             AImageDecoder_createFromBuffer: load!("AImageDecoder_createFromBuffer"),
@@ -143,12 +109,6 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
             AImageDecoder_setAndroidBitmapFormat: load!("AImageDecoder_setAndroidBitmapFormat"),
             AImageDecoder_getMinimumStride: load!("AImageDecoder_getMinimumStride"),
             AImageDecoder_decodeImage: load!("AImageDecoder_decodeImage"),
-            AImageDecoder_isAnimated: load_opt!("AImageDecoder_isAnimated"),
-            AImageDecoder_advanceFrame: load_opt!("AImageDecoder_advanceFrame"),
-            AImageDecoder_getFrameInfo: load_opt!("AImageDecoder_getFrameInfo"),
-            AImageDecoderFrameInfo_create: load_opt!("AImageDecoderFrameInfo_create"),
-            AImageDecoderFrameInfo_getDuration: load_opt!("AImageDecoderFrameInfo_getDuration"),
-            AImageDecoderFrameInfo_delete: load_opt!("AImageDecoderFrameInfo_delete"),
         })
     }
 }
@@ -220,118 +180,31 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
         let buf_size = stride * h as usize;
         let mut buf = vec![0u8; buf_size];
 
-        // ── Animated or static? ────────────────────────────────────────────
-        // AImageDecoder_isAnimated requires API 31+. Only GIFs take the
-        // animated path; other animated formats keep the poster-frame path.
-        let input_is_gif = matches!(ImageFormat::detect(input), Some(ImageFormat::Gif));
-        let animated = match api.AImageDecoder_isAnimated {
-            Some(is_anim) => is_anim(dec) != 0 && input_is_gif,
-            None => false,
-        };
-
-        let result = if !animated {
-            // ── Static ──────────────────────────────────────────────────────
-            let ret = (api.AImageDecoder_decodeImage)(
-                dec,
-                buf.as_mut_ptr() as *mut c_void,
-                stride,
-                buf_size,
-            );
-            if ret != ANDROID_IMAGE_DECODER_SUCCESS {
-                (api.AImageDecoder_delete)(dec);
-                if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
-                    return Err(Error::PlatformNotSupported(
-                        "format not supported by AImageDecoder on this device".into(),
-                    ));
-                }
-                return Err(Error::DecodeError(format!(
-                    "AImageDecoder_decodeImage failed: {}",
-                    ret
-                )));
-            }
-            // stride may be wider than w*4; slice to exact RGBA rows
-            let rgba = compact_rgba(&buf, w, h, stride);
-            let (target_w, target_h) =
-                compute_target_dimensions(w, h, options.min_width, options.min_height);
-            let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
-            webp_encode::encode_static(&resized, target_w, target_h, options.quality)
-        } else {
-            // ── Animated GIF → animated WebP ────────────────────────────────
-            // Animation helpers require API 31+; if absent, return error so
-            // the caller can fall back to JNI BitmapFactory (static only).
-            if api.AImageDecoder_advanceFrame.is_none()
-                || api.AImageDecoder_getFrameInfo.is_none()
-                || api.AImageDecoderFrameInfo_create.is_none()
-                || api.AImageDecoderFrameInfo_getDuration.is_none()
-                || api.AImageDecoderFrameInfo_delete.is_none()
-            {
-                (api.AImageDecoder_delete)(dec);
+        // GIF input is handled by the shared zengif codec before this point;
+        // only the first frame of any other input reaches this decoder.
+        let ret = (api.AImageDecoder_decodeImage)(
+            dec,
+            buf.as_mut_ptr() as *mut c_void,
+            stride,
+            buf_size,
+        );
+        if ret != ANDROID_IMAGE_DECODER_SUCCESS {
+            (api.AImageDecoder_delete)(dec);
+            if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
                 return Err(Error::PlatformNotSupported(
-                    "AImageDecoder animation functions not available on this device".into(),
+                    "format not supported by AImageDecoder on this device".into(),
                 ));
             }
-            let advance_frame = api.AImageDecoder_advanceFrame.unwrap();
-            let frame_info_get = api.AImageDecoder_getFrameInfo.unwrap();
-            let frame_info_create = api.AImageDecoderFrameInfo_create.unwrap();
-            let frame_info_gd = api.AImageDecoderFrameInfo_getDuration.unwrap();
-            let frame_info_delete = api.AImageDecoderFrameInfo_delete.unwrap();
+            return Err(Error::DecodeError(format!(
+                "AImageDecoder_decodeImage failed: {}",
+                ret
+            )));
+        }
 
-            let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::new();
-            let mut is_first = true;
-
-            loop {
-                let ret = (api.AImageDecoder_decodeImage)(
-                    dec,
-                    buf.as_mut_ptr() as *mut c_void,
-                    stride,
-                    buf_size,
-                );
-                if ret != ANDROID_IMAGE_DECODER_SUCCESS {
-                    if is_first {
-                        (api.AImageDecoder_delete)(dec);
-                        if ret == ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT {
-                            return Err(Error::PlatformNotSupported(
-                                "format not supported by AImageDecoder on this device".into(),
-                            ));
-                        }
-                        return Err(Error::DecodeError(format!(
-                            "AImageDecoder_decodeImage failed on frame 0: {}",
-                            ret
-                        )));
-                    }
-                    break;
-                }
-                is_first = false;
-
-                let rgba = compact_rgba(&buf, w, h, stride);
-                let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
-
-                // Read frame duration before advancing. The frame info is
-                // empty until AImageDecoder_getFrameInfo fills it.
-                let fi = frame_info_create();
-                let delay_ms = if fi.is_null() {
-                    DEFAULT_DELAY_MS
-                } else {
-                    let ms = if frame_info_get(dec, fi) == ANDROID_IMAGE_DECODER_SUCCESS {
-                        // Convert ns → ms as-is, no clamping
-                        (frame_info_gd(fi) / 1_000_000) as i32
-                    } else {
-                        DEFAULT_DELAY_MS
-                    };
-                    frame_info_delete(fi);
-                    ms
-                };
-
-                frame_data.push((resized, delay_ms));
-
-                let adv = advance_frame(dec);
-                if adv != ANDROID_IMAGE_DECODER_SUCCESS {
-                    break;
-                }
-            }
-
-            webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
-        };
+        // stride may be wider than w*4; slice to exact RGBA rows
+        let rgba = compact_rgba(&buf, w, h, stride);
+        let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
+        let result = webp_encode::encode_static(&resized, target_w, target_h, options.quality);
 
         (api.AImageDecoder_delete)(dec);
         result

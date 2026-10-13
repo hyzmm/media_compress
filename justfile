@@ -1,5 +1,6 @@
 test_web_chrome:
-    # Runs compress_image_js (Canvas-based WebP encoding) in Chrome.
+    # Runs compress_image_js in Chrome (GIF → zengif re-encode; other formats
+    # via Canvas → WebP).
     # Prerequisites (one-time setup):
     #   cargo install wasm-pack
     #   Download chromedriver matching your Chrome version to ~/bin/chromedriver:
@@ -10,14 +11,6 @@ test_web_chrome:
 
 test_web_safari:
     PATH=$PATH:~/bin wasm-pack test --headless --safari --test compress_images_wasm_browser -- --nocapture
-
-test_web_chrome_zenwebp:
-    # Same browser tests with the pure-Rust zenwebp encoder (wasm ~+419 KiB).
-    # --features must come before `--` (args after `--` go to the wasm-bindgen
-    # test runner); --release because debug wasm zenwebp encoding is very slow.
-    # The GIF test asserts an animated WebP (ANIM chunk), which requires a
-    # browser with the WebCodecs ImageDecoder API (Chrome) — hence Chrome here.
-    PATH=$PATH:~/bin wasm-pack test --release --headless --chrome --test compress_images_wasm_browser --features web-zenwebp -- --nocapture
 
 test_ios:
     rustup target add aarch64-apple-ios-sim
@@ -52,9 +45,7 @@ build_android:
     cargo dinghy --platform auto-android-aarch64-api24 build --release
 
 build_web_canvas:
-    # Default: browser Canvas encoder (~32 KiB wasm).
+    # Browser build: GIF input is re-encoded as GIF by zengif (wasm ~227 KiB raw
+    # / ~92 KiB gz; was ~32 KiB before zengif); all other formats go through the
+    # browser Canvas encoder → WebP.
     wasm-pack build --release
-
-build_web_zenwebp:
-    # Pure-Rust zenwebp encoder (~450 KiB wasm; see README).
-    wasm-pack build --release -- --features web-zenwebp

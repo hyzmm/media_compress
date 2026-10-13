@@ -10,46 +10,49 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 thiserror = "2"
 anyhow = "1"
+# GIF codec: decode + re-encode as GIF (all platforms, including wasm).
+# quantette is MIT/Apache-2.0; zengif's default `zenquant` quantizer is
+# AGPL-3.0-or-later, so it is deliberately not enabled.
+zengif = { version = "0.7.3", default-features = false, features = [
+    "std",
+    "quantette",
+] }
 
-[features]
-# Encode WebP in wasm with the pure-Rust zenwebp encoder instead of the
-# browser canvas encoder. Build with:
-#   wasm-pack build --release -- --features web-zenwebp
-web-zenwebp = ["dep:zenwebp"]
-
-# libwebp is not used on WASM — encoding is delegated to the browser Canvas API
-# (or to the zenwebp crate behind the `web-zenwebp` feature).
+# libwebp is not used on WASM — static WebP encoding is delegated to the
+# browser Canvas API.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 webp = { version = "0.3", default-features = false }
-# Used directly for animated WebP encoding (WebPAnimEncoder), where the `webp`
-# crate's wrapper cannot express the animation end timestamp.
-libwebp-sys = "0.9"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
-# Optional pure-Rust WebP encoder, enabled by the `web-zenwebp` feature.
-zenwebp = { version = "=0.4.4", optional = true }
 web-sys = { version = "0.3", features = [
     "OffscreenCanvas",
-    "OffscreenCanvasRenderingContext2d",
     "ImageEncodeOptions",
-    "ImageData",
     "Blob",
     "ImageBitmap",
-    "Window",
     "ImageBitmapRenderingContext",
-    "VideoFrame",
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk-context = "0.1"
 
-# codec comparison bench (examples/codec_bench.rs)
+# codec comparison benches (examples/codec_bench.rs, examples/gif_zengif_bench.rs)
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 zenwebp = "0.4.4"
+libwebp-sys = "0.9"
+# The extra quantizers exist only for the GIF bench's comparison rows; the
+# library itself builds zengif with `quantette` only.
+zengif = { version = "0.7.3", default-features = false, features = [
+    "std",
+    "zenquant",
+    "quantette",
+    "quantizr",
+    "color_quant",
+    "imagequant",
+] }
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",

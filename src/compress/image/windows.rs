@@ -2,7 +2,7 @@ use std::ffi::c_void;
 
 use super::orientation::apply_exif_orientation_rgba;
 use super::webp_encode;
-use super::{compute_target_dimensions, resize, CompressOptions, ImageFormat};
+use super::{compute_target_dimensions, resize, CompressOptions};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -27,9 +27,6 @@ const WIC_DECODE_METADATA_CACHE_ON_LOAD: u32 = 0;
 const WIC_BITMAP_DITHER_TYPE_NONE: u32 = 0;
 /// WICBitmapPaletteType: WICBitmapPaletteTypeCustom = 0
 const WIC_BITMAP_PALETTE_TYPE_CUSTOM: u32 = 0;
-
-/// Fallback GIF frame delay when the source carries no delay metadata.
-const DEFAULT_DELAY_MS: i32 = 100;
 
 // ---------------------------------------------------------------------------
 // GUID / IID
@@ -360,45 +357,6 @@ unsafe fn decode_wic_frame(
     Ok((pixels, w, h))
 }
 
-/// Read GIF frame delay via metadata query "/grctlext/Delay" (unit: 1/100 s).
-/// Returns milliseconds; falls back to `DEFAULT_DELAY_MS` on any failure.
-unsafe fn get_gif_delay_ms(frame: *mut c_void) -> i32 {
-    let mut mqr: *mut c_void = std::ptr::null_mut();
-    let hr: HRESULT = com_call!(
-        frame,
-        WIC_FRAME_GET_METADATA_QUERY_READER,
-        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
-        &mut mqr
-    );
-    if hr != S_OK || mqr.is_null() {
-        return DEFAULT_DELAY_MS;
-    }
-
-    // Build a PROPVARIANT to receive the result
-    let mut pv = PROPVARIANT::zero();
-
-    // Path: "/grctlext/Delay" as a null-terminated wide string
-    let path_wide: Vec<u16> = "/grctlext/Delay\0".encode_utf16().collect();
-
-    let hr: HRESULT = com_call!(
-        mqr,
-        WIC_METADATA_GET_BY_NAME,
-        unsafe extern "system" fn(*mut c_void, *const u16, *mut PROPVARIANT) -> HRESULT,
-        path_wide.as_ptr(),
-        &mut pv
-    );
-
-    com_call!(mqr, 2, unsafe extern "system" fn(*mut c_void) -> u32); // Release MQR
-
-    if hr != S_OK || pv.vt != VT_UI2 {
-        return DEFAULT_DELAY_MS;
-    }
-
-    // Delay is in units of 1/100 second → convert to ms (as-is, no clamping)
-    let hundredths = pv.val.ui_val as i32;
-    hundredths * 10
-}
-
 /// Read image orientation via WIC metadata query reader.
 /// Returns EXIF orientation in 1..=8, or 1 when not present.
 unsafe fn get_frame_orientation(frame: *mut c_void) -> u32 {
@@ -534,8 +492,8 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             ));
         }
 
-        let input_is_gif = matches!(ImageFormat::detect(input), Some(ImageFormat::Gif));
-
+        // GIF input is handled by the shared zengif codec before this point;
+        // other multi-frame formats (APNG, multi-page TIFF) get a poster frame.
         let result = if frame_count == 1 {
             // ── Static image ────────────────────────────────────────────────
             let mut frame: *mut c_void = std::ptr::null_mut();
@@ -564,58 +522,6 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
                 compute_target_dimensions(w, h, options.min_width, options.min_height);
             let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
             webp_encode::encode_static(&resized, target_w, target_h, options.quality)
-        } else if input_is_gif {
-            // ── Animated GIF → animated WebP ────────────────────────────────
-            // Decode every frame; delays are taken from the GIF metadata as-is.
-            let mut frame0: *mut c_void = std::ptr::null_mut();
-            let hr: HRESULT = com_call!(
-                decoder,
-                WIC_DECODER_GET_FRAME,
-                unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
-                0u32,
-                &mut frame0
-            );
-            if hr != S_OK || frame0.is_null() {
-                com_call!(decoder, 2, unsafe extern "system" fn(*mut c_void) -> u32);
-                com_call!(factory, 2, unsafe extern "system" fn(*mut c_void) -> u32);
-                return Err(Error::DecodeError(
-                    "IWICBitmapDecoder::GetFrame(0) failed for animated image".into(),
-                ));
-            }
-
-            let delay0 = get_gif_delay_ms(frame0);
-            let r0 = decode_wic_frame(factory, frame0);
-            com_call!(frame0, 2, unsafe extern "system" fn(*mut c_void) -> u32);
-            let (pixels0, w, h) = r0?;
-            let (target_w, target_h) =
-                compute_target_dimensions(w, h, options.min_width, options.min_height);
-
-            let mut frame_data: Vec<(Vec<u8>, i32)> = Vec::with_capacity(frame_count as usize);
-            let first_resized = resize::resize_rgba_nearest(&pixels0, w, h, target_w, target_h);
-            frame_data.push((first_resized, delay0));
-
-            for i in 1..frame_count {
-                let mut frame: *mut c_void = std::ptr::null_mut();
-                let hr: HRESULT = com_call!(
-                    decoder,
-                    WIC_DECODER_GET_FRAME,
-                    unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
-                    i,
-                    &mut frame
-                );
-                if hr != S_OK || frame.is_null() {
-                    break; // best-effort: stop at first failure
-                }
-
-                let delay = get_gif_delay_ms(frame);
-                let r = decode_wic_frame(factory, frame);
-                com_call!(frame, 2, unsafe extern "system" fn(*mut c_void) -> u32);
-                let (pixels, _, _) = r?;
-                let resized = resize::resize_rgba_nearest(&pixels, w, h, target_w, target_h);
-                frame_data.push((resized, delay));
-            }
-
-            webp_encode::encode_animated(&frame_data, target_w, target_h, options.quality)
         } else {
             // ── Other multi-frame images (APNG, multi-page TIFF) ───────────
             // Export a WebP poster frame from the first decoded frame.

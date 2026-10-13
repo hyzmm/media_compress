@@ -7,7 +7,9 @@ mod webp_encode;
 #[cfg(not(target_arch = "wasm32"))]
 mod orientation;
 
-#[cfg(not(target_arch = "wasm32"))]
+// GIF decode + re-encode (zengif); used on every platform, native and wasm.
+pub(crate) mod gif;
+
 pub(crate) mod resize;
 
 // Platform-specific decoder modules
@@ -144,14 +146,15 @@ pub(crate) fn compute_target_dimensions(
 ///
 /// WebP input is rejected with [`Error::UnsupportedFormat`]: it already is the
 /// output format, so re-encoding it would only add another lossy generation.
-/// Animated GIFs are decoded frame by frame and encoded as animated WebP with
-/// their original per-frame delays. Other animated formats (APNG) are reduced
-/// to their first frame.
+/// GIF input is decoded and re-encoded as GIF (zengif + the quantette
+/// quantizer): per-frame delays and the loop count are preserved as-is.
+/// Other animated formats (APNG) are reduced to their first frame.
 ///
 /// # Arguments
 /// * `input`   — raw bytes of the source image (any supported format)
 /// * `options` — compression options:
-///   - `quality`: WebP lossy quality, 0–100
+///   - `quality`: lossy quality, 0–100 (drives the WebP encoder; the GIF
+///     quantizer currently ignores it)
 ///   - `min_width` / `min_height`: optional lower bound for output size.
 ///     Compression may downscale while preserving aspect ratio, but will not
 ///     upscale when the source image is already smaller.
@@ -159,9 +162,9 @@ pub(crate) fn compute_target_dimensions(
 /// # Platform support
 /// | Platform | Formats                                   |
 /// |----------|-------------------------------------------|
-/// | macOS / iOS | JPEG, PNG, GIF (animated), BMP, HEIC, TIFF |
-/// | Android (API 24+) | JPEG, PNG, GIF (animated on API 31+), BMP, TIFF |
-/// | Windows  | JPEG, PNG, GIF (animated), BMP, TIFF |
+/// | macOS / iOS | JPEG, PNG, GIF (→ GIF), BMP, HEIC, TIFF |
+/// | Android (API 24+) | JPEG, PNG, GIF (→ GIF), BMP, TIFF |
+/// | Windows  | JPEG, PNG, GIF (→ GIF), BMP, TIFF |
 /// | Web/WASM | not supported; use `compress_image_js` instead |
 pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     // Validate or detect format (used only for error messages if the platform
@@ -172,6 +175,17 @@ pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>,
 
     if fmt == ImageFormat::Webp {
         return Err(Error::UnsupportedFormat(WEBP_INPUT_REJECTED.into()));
+    }
+
+    // GIF is handled by the shared zengif codec on every platform; the
+    // platform decoders below never see GIF input.
+    if fmt == ImageFormat::Gif {
+        let compressed = gif::compress_gif(input, options)?;
+        return Ok(if compressed.len() > input.len() {
+            input.to_vec()
+        } else {
+            compressed
+        });
     }
 
     // Whether the source format is one of the common lossy/lossless formats
