@@ -65,7 +65,9 @@ type GetMinimumStrideFn = unsafe extern "C" fn(*mut AImageDecoder) -> usize;
 type DecodeImageFn = unsafe extern "C" fn(*mut AImageDecoder, *mut c_void, usize, usize) -> i32;
 type IsAnimatedFn = unsafe extern "C" fn(*mut AImageDecoder) -> i32;
 type AdvanceFrameFn = unsafe extern "C" fn(*mut AImageDecoder) -> i32;
-type FrameInfoCreateFn = unsafe extern "C" fn(*mut AImageDecoder) -> *mut AImageDecoderFrameInfo;
+type FrameInfoCreateFn = unsafe extern "C" fn() -> *mut AImageDecoderFrameInfo;
+type FrameInfoGetInfoFn =
+    unsafe extern "C" fn(*mut AImageDecoder, *mut AImageDecoderFrameInfo) -> i32;
 type FrameInfoGetDurationFn = unsafe extern "C" fn(*const AImageDecoderFrameInfo) -> i64;
 type FrameInfoDeleteFn = unsafe extern "C" fn(*mut AImageDecoderFrameInfo);
 
@@ -83,6 +85,7 @@ struct Api {
     // Animation helpers — present on API 31+ only
     AImageDecoder_isAnimated: Option<IsAnimatedFn>,
     AImageDecoder_advanceFrame: Option<AdvanceFrameFn>,
+    AImageDecoder_getFrameInfo: Option<FrameInfoGetInfoFn>,
     AImageDecoderFrameInfo_create: Option<FrameInfoCreateFn>,
     AImageDecoderFrameInfo_getDuration: Option<FrameInfoGetDurationFn>,
     AImageDecoderFrameInfo_delete: Option<FrameInfoDeleteFn>,
@@ -142,6 +145,7 @@ fn try_load_from(handle: *mut c_void) -> Option<Api> {
             AImageDecoder_decodeImage: load!("AImageDecoder_decodeImage"),
             AImageDecoder_isAnimated: load_opt!("AImageDecoder_isAnimated"),
             AImageDecoder_advanceFrame: load_opt!("AImageDecoder_advanceFrame"),
+            AImageDecoder_getFrameInfo: load_opt!("AImageDecoder_getFrameInfo"),
             AImageDecoderFrameInfo_create: load_opt!("AImageDecoderFrameInfo_create"),
             AImageDecoderFrameInfo_getDuration: load_opt!("AImageDecoderFrameInfo_getDuration"),
             AImageDecoderFrameInfo_delete: load_opt!("AImageDecoderFrameInfo_delete"),
@@ -256,6 +260,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
             // Animation helpers require API 31+; if absent, return error so
             // the caller can fall back to JNI BitmapFactory (static only).
             if api.AImageDecoder_advanceFrame.is_none()
+                || api.AImageDecoder_getFrameInfo.is_none()
                 || api.AImageDecoderFrameInfo_create.is_none()
                 || api.AImageDecoderFrameInfo_getDuration.is_none()
                 || api.AImageDecoderFrameInfo_delete.is_none()
@@ -266,6 +271,7 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
                 ));
             }
             let advance_frame = api.AImageDecoder_advanceFrame.unwrap();
+            let frame_info_get = api.AImageDecoder_getFrameInfo.unwrap();
             let frame_info_create = api.AImageDecoderFrameInfo_create.unwrap();
             let frame_info_gd = api.AImageDecoderFrameInfo_getDuration.unwrap();
             let frame_info_delete = api.AImageDecoderFrameInfo_delete.unwrap();
@@ -300,15 +306,20 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
                 let rgba = compact_rgba(&buf, w, h, stride);
                 let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
 
-                // Read frame duration before advancing
-                let fi = frame_info_create(dec);
+                // Read frame duration before advancing. The frame info is
+                // empty until AImageDecoder_getFrameInfo fills it.
+                let fi = frame_info_create();
                 let delay_ms = if fi.is_null() {
                     DEFAULT_DELAY_MS
                 } else {
-                    let ns = frame_info_gd(fi);
+                    let ms = if frame_info_get(dec, fi) == ANDROID_IMAGE_DECODER_SUCCESS {
+                        // Convert ns → ms as-is, no clamping
+                        (frame_info_gd(fi) / 1_000_000) as i32
+                    } else {
+                        DEFAULT_DELAY_MS
+                    };
                     frame_info_delete(fi);
-                    // Convert ns → ms as-is, no clamping
-                    (ns / 1_000_000) as i32
+                    ms
                 };
 
                 frame_data.push((resized, delay_ms));

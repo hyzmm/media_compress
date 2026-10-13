@@ -101,6 +101,7 @@ extern "C" {
 
     static kCGImagePropertyGIFDictionary: CFStringRef;
     static kCGImagePropertyGIFDelayTime: CFStringRef;
+    static kCGImagePropertyGIFUnclampedDelayTime: CFStringRef;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,9 +246,13 @@ unsafe fn encode_first_frame_to_webp(
     super::webp_encode::encode_static(&resized, target_w, target_h, options.quality)
 }
 
-/// Read the GIF frame delay (kCGImagePropertyGIFDelayTime, in seconds) for the
-/// frame at `index`, converted to milliseconds. Returns `DEFAULT_DELAY_MS`
-/// when the metadata is absent or unreadable.
+/// Read the GIF frame delay (in seconds) for the frame at `index`, converted
+/// to milliseconds. Prefers `kCGImagePropertyGIFUnclampedDelayTime` — the raw
+/// source value — because the clamped `kCGImagePropertyGIFDelayTime` raises
+/// sub-~20ms delays to 100ms (browser convention), which would make delays
+/// platform-dependent. Falls back to the clamped key when unclamped is
+/// absent. Returns `DEFAULT_DELAY_MS` when the metadata is absent or
+/// unreadable.
 unsafe fn get_gif_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
     let props = CGImageSourceCopyPropertiesAtIndex(src, index, std::ptr::null());
     if props.is_null() {
@@ -261,7 +266,11 @@ unsafe fn get_gif_delay_ms(src: CGImageSourceRef, index: usize) -> i32 {
         return DEFAULT_DELAY_MS;
     }
 
-    let delay_val = CFDictionaryGetValue(gif_dict, kCGImagePropertyGIFDelayTime as CFTypeRef);
+    let mut delay_val =
+        CFDictionaryGetValue(gif_dict, kCGImagePropertyGIFUnclampedDelayTime as CFTypeRef);
+    if delay_val.is_null() {
+        delay_val = CFDictionaryGetValue(gif_dict, kCGImagePropertyGIFDelayTime as CFTypeRef);
+    }
     if delay_val.is_null() {
         CFRelease(props as CFTypeRef);
         return DEFAULT_DELAY_MS;
