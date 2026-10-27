@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::error::Error;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -8,6 +10,11 @@ mod android;
 
 #[cfg(target_os = "windows")]
 mod windows;
+
+// Pure-Rust transform helpers used by the Apple path; compiled on the Apple
+// platforms and during `cargo test` so the orientation math runs on the host.
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+mod transform;
 
 // Pure-Rust YUV helpers used by the Android path; compiled on Android and
 // during `cargo test` (so its unit tests run on the host).
@@ -132,6 +139,90 @@ pub(crate) fn compute_video_target_dimensions(
     ((w.max(2) / 2) * 2, (h.max(2) / 2) * 2)
 }
 
+/// Compress a video file directly from `input` to `output`.
+///
+/// The input and output files never go through memory: the platform backend
+/// reads and writes them itself.
+///
+/// Returns `Ok(true)` when `output` contains a smaller re-encode. Returns
+/// `Ok(false)` when the re-encode was not smaller, in which case `output` has
+/// been removed and the caller should keep the original file.
+pub fn compress_video_file(
+    input: &Path,
+    output: &Path,
+    options: VideoCompressOptions,
+) -> Result<bool, Error> {
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    )))]
+    {
+        let _ = (input, output, options);
+        return Err(Error::PlatformNotSupported(
+            "Video compression is currently only supported on macOS/iOS/Android/Windows".into(),
+        ));
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
+    {
+        let header = read_header(input)?;
+        VideoFormat::detect(&header).ok_or_else(|| {
+            Error::UnsupportedFormat("Cannot detect video format from magic bytes".into())
+        })?;
+
+        let input_len = std::fs::metadata(input)
+            .map_err(|e| Error::DecodeError(format!("failed to stat input video: {e}")))?
+            .len();
+
+        match compress_video_file_platform(input, output, options) {
+            Ok(()) => {
+                let output_len = std::fs::metadata(output)
+                    .map_err(|e| Error::EncodeError(format!("failed to stat output video: {e}")))?
+                    .len();
+                if output_len >= input_len {
+                    let _ = std::fs::remove_file(output);
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(output);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Read just enough of the file to run [`VideoFormat::detect`] (MPEG-TS needs
+/// byte 188).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
+fn read_header(path: &Path) -> Result<Vec<u8>, Error> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| Error::DecodeError(format!("failed to open input video: {e}")))?;
+    let mut header = vec![0u8; 189];
+    let len = file
+        .read(&mut header)
+        .map_err(|e| Error::DecodeError(format!("failed to read input video header: {e}")))?;
+    header.truncate(len);
+
+    Ok(header)
+}
+
 /// Compress a video to H.264 in an MP4 container.
 ///
 /// # Arguments
@@ -178,10 +269,40 @@ fn compress_video_platform(input: &[u8], options: VideoCompressOptions) -> Resul
     target_os = "android",
     target_os = "windows"
 )))]
-fn compress_video_platform(_input: &[u8], _options: VideoCompressOptions) -> Result<Vec<u8>, Error> {
+fn compress_video_platform(
+    _input: &[u8],
+    _options: VideoCompressOptions,
+) -> Result<Vec<u8>, Error> {
     Err(Error::PlatformNotSupported(
         "Video compression is currently only supported on macOS/iOS/Android/Windows".into(),
     ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn compress_video_file_platform(
+    input: &Path,
+    output: &Path,
+    options: VideoCompressOptions,
+) -> Result<(), Error> {
+    apple::compress_file(input, output, options)
+}
+
+#[cfg(target_os = "android")]
+fn compress_video_file_platform(
+    input: &Path,
+    output: &Path,
+    options: VideoCompressOptions,
+) -> Result<(), Error> {
+    android::compress_file(input, output, options)
+}
+
+#[cfg(target_os = "windows")]
+fn compress_video_file_platform(
+    input: &Path,
+    output: &Path,
+    options: VideoCompressOptions,
+) -> Result<(), Error> {
+    windows::compress_file(input, output, options)
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use media_compress::{compress_video, VideoCompressOptions};
+use media_compress::{compress_video, compress_video_file, VideoCompressOptions};
 
 fn is_mp4(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
@@ -134,6 +134,55 @@ fn compress_all_test_videos() {
     );
 }
 
+/// Compress a source video through the file-path API and verify the output is
+/// a valid, smaller MP4. This is the API used by hosts that must not load the
+/// whole video into memory.
+#[test]
+fn compress_video_file_downscales() {
+    let input_path = input_dir().join("sample.mp4");
+    if !input_path.exists() {
+        eprintln!("sample.mp4 does not exist — skipping test");
+        return;
+    }
+
+    let output_dir = base_dir().join("out_videos");
+    fs::create_dir_all(&output_dir).expect("failed to create out_videos/");
+    let output_path = output_dir.join("sample_file_api.mp4");
+    let _ = fs::remove_file(&output_path);
+
+    let mut options = VideoCompressOptions::new(800);
+    options.max_width = Some(640);
+    options.max_height = Some(360);
+
+    let compressed = compress_video_file(&input_path, &output_path, options)
+        .expect("file api compression failed");
+    assert!(
+        compressed,
+        "expected the file api to produce a smaller file"
+    );
+
+    let output = fs::read(&output_path).expect("failed to read file api output");
+    assert!(is_mp4(&output), "expected MP4 output");
+    assert!(!output.is_empty(), "output is empty");
+
+    let input_len = fs::metadata(&input_path)
+        .expect("failed to stat input")
+        .len() as usize;
+    assert!(
+        output.len() < input_len,
+        "file api output should be smaller than input ({} vs {})",
+        output.len(),
+        input_len
+    );
+
+    eprintln!(
+        "file api downscaled: {} -> {} bytes ({:.1}%)",
+        input_len,
+        output.len(),
+        output.len() as f64 / input_len as f64 * 100.0
+    );
+}
+
 /// Downscale a source video to a smaller resolution cap and verify the output
 /// is a valid, smaller MP4.
 #[test]
@@ -167,4 +216,3 @@ fn compress_video_downscales() {
         out.len() as f64 / input.len() as f64 * 100.0
     );
 }
-

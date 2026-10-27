@@ -200,6 +200,18 @@ pub fn compress(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, 
     }
 }
 
+/// Transcode a video file directly to `out_path`.
+///
+/// Neither file is buffered in memory; MediaExtractor/MediaCodec stream
+/// samples through file descriptors.
+pub fn compress_file(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    options: VideoCompressOptions,
+) -> Result<(), Error> {
+    transcode(input, output, options)
+}
+
 // ---------------------------------------------------------------------------
 // Transcode implementation
 // ---------------------------------------------------------------------------

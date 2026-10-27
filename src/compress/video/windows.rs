@@ -605,6 +605,17 @@ pub fn compress(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, 
     }
 }
 
+/// Transcode a video file directly to `out_path`.
+///
+/// Neither file is buffered in memory; Media Foundation streams samples.
+pub fn compress_file(
+    input: &Path,
+    output: &Path,
+    options: VideoCompressOptions,
+) -> Result<(), Error> {
+    transcode(input, output, options)
+}
+
 // ---------------------------------------------------------------------------
 // Transcode implementation
 // ---------------------------------------------------------------------------

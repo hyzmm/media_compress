@@ -169,7 +169,8 @@ std::fs::write("out.mp4", out)?;
 ```
 
 - 支持的源容器：MP4 / MOV（QuickTime）等平台可解码格式。
-- 竖屏/旋转视频的旋正暂未处理，作为后续项。
+- macOS / iOS 会把视频轨的 `preferredTransform` 应用到输出，竖屏/旋转视频保持正确方向；Android / Windows 暂未处理旋转元数据。
+- 文件路径版 API `compress_video_file(input, output, options)` 直接读写文件，不把视频载入内存；产物不更小时会删除产物并返回 `false`，调用方沿用原文件。
 
 ## Android 集成与初始化
 

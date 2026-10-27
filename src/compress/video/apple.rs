@@ -3,6 +3,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::transform::{display_size_u32, layer_transform, CGAffineTransform};
 use super::{compute_video_target_dimensions, VideoCompressOptions, VideoFormat};
 use crate::error::Error;
 
@@ -45,17 +46,6 @@ struct CMTime {
 struct CMTimeRange {
     start: CMTime,
     duration: CMTime,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGAffineTransform {
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
-    tx: f64,
-    ty: f64,
 }
 
 #[repr(C)]
@@ -142,16 +132,35 @@ define_msg_send! {
 
 // Large-struct return differs by arch: x86_64 uses the explicit stret
 // trampoline, aarch64 returns indirectly via x8 (plain objc_msgSend).
+// As with `objc_msgSend` above, the symbol is declared exactly once and each
+// helper transmutes it to the exact signature it needs.
 #[cfg(target_arch = "x86_64")]
 #[link(name = "objc", kind = "dylib")]
 extern "C" {
     #[link_name = "objc_msgSend_stret"]
-    fn msg_stret_cmtime(ret: *mut CMTime, receiver: Id, sel: Sel);
+    fn objc_msg_send_stret_raw();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn msg_stret_cmtime(ret: *mut CMTime, receiver: Id, sel: Sel) {
+    let send: unsafe extern "C" fn(*mut CMTime, Id, Sel) =
+        std::mem::transmute(objc_msg_send_stret_raw as unsafe extern "C" fn());
+    send(ret, receiver, sel);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn msg_stret_transform(ret: *mut CGAffineTransform, receiver: Id, sel: Sel) {
+    let send: unsafe extern "C" fn(*mut CGAffineTransform, Id, Sel) =
+        std::mem::transmute(objc_msg_send_stret_raw as unsafe extern "C" fn());
+    send(ret, receiver, sel);
 }
 
 #[cfg(target_arch = "aarch64")]
 define_msg_send! {
     msg_cmtime() -> CMTime;
+    msg_transform() -> CGAffineTransform;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,19 +184,14 @@ extern "C" {
         key_callbacks: *const CFDictionaryKeyCallBacks,
         value_callbacks: *const CFDictionaryKeyCallBacks,
     ) -> CFDictionaryRef;
-    fn CFNumberCreate(allocator: CFAllocatorRef, the_type: i32, value_ptr: *const c_void) -> CFNumberRef;
+    fn CFNumberCreate(
+        allocator: CFAllocatorRef,
+        the_type: i32,
+        value_ptr: *const c_void,
+    ) -> CFNumberRef;
 
     static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
     static kCFTypeDictionaryValueCallBacks: CFDictionaryKeyCallBacks;
-}
-
-// ---------------------------------------------------------------------------
-// FFI — CoreGraphics
-// ---------------------------------------------------------------------------
-
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGAffineTransformMakeScale(sx: f64, sy: f64) -> CGAffineTransform;
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +269,20 @@ unsafe fn asset_duration(asset: Id) -> CMTime {
     #[cfg(target_arch = "aarch64")]
     {
         msg_cmtime(asset, sel(c"duration"))
+    }
+}
+
+/// The track's display orientation/scale relative to its encoded pixels.
+unsafe fn track_preferred_transform(track: Id) -> CGAffineTransform {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut transform = CGAffineTransform::IDENTITY;
+        msg_stret_transform(&mut transform, track, sel(c"preferredTransform"));
+        transform
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        msg_transform(track, sel(c"preferredTransform"))
     }
 }
 
@@ -355,6 +373,17 @@ pub fn compress(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, 
     }
 }
 
+/// Transcode a video file directly to `out_path`.
+///
+/// Neither file is buffered in memory; AVFoundation streams samples.
+pub fn compress_file(
+    input: &Path,
+    output: &Path,
+    options: VideoCompressOptions,
+) -> Result<(), Error> {
+    unsafe { transcode(input, output, options) }
+}
+
 // ---------------------------------------------------------------------------
 // Transcode implementation
 // ---------------------------------------------------------------------------
@@ -394,9 +423,14 @@ unsafe fn transcode(
         if src_w == 0 || src_h == 0 {
             return Err(Error::DecodeError("video track has zero dimensions".into()));
         }
+
+        // The composition does not apply the track's `preferredTransform`; keep
+        // it here and fold it into the layer instruction below.
+        let preferred = track_preferred_transform(video_track);
+        let (display_w, display_h) = display_size_u32(src_w, src_h, preferred);
         let (target_w, target_h) = compute_video_target_dimensions(
-            src_w,
-            src_h,
+            display_w,
+            display_h,
             options.max_width,
             options.max_height,
         );
@@ -411,7 +445,10 @@ unsafe fn transcode(
         };
 
         // ── Video composition (scaling) ──────────────────────────────────
-        let comp = msg_id(class(c"AVMutableVideoComposition"), sel(c"videoComposition"));
+        let comp = msg_id(
+            class(c"AVMutableVideoComposition"),
+            sel(c"videoComposition"),
+        );
         if comp.is_null() {
             return Err(Error::EncodeError(
                 "AVMutableVideoComposition creation failed".into(),
@@ -474,10 +511,13 @@ unsafe fn transcode(
                 "videoCompositionLayerInstruction creation failed".into(),
             ));
         }
-        let sx = target_w as f64 / src_w as f64;
-        let sy = target_h as f64 / src_h as f64;
-        let transform = CGAffineTransformMakeScale(sx, sy);
-        msg_set_transform(layer, sel(c"setTransform:atTime:"), transform, cmtime_numeric_zero());
+        let transform = layer_transform(src_w as f64, src_h as f64, preferred, target_w, target_h);
+        msg_set_transform(
+            layer,
+            sel(c"setTransform:atTime:"),
+            transform,
+            cmtime_numeric_zero(),
+        );
 
         let layer_array = msg_id1(class(c"NSArray"), sel(c"arrayWithObject:"), layer);
         msg_void1(instruction, sel(c"setLayerInstructions:"), layer_array);
@@ -625,13 +665,21 @@ unsafe fn transcode(
         // ── Start ────────────────────────────────────────────────────────
         if msg_bool(reader, sel(c"startReading")) == 0 {
             msg_void(writer, sel(c"cancelWriting"));
-            return Err(Error::DecodeError("AVAssetReader startReading failed".into()));
+            return Err(Error::DecodeError(
+                "AVAssetReader startReading failed".into(),
+            ));
         }
         if msg_bool(writer, sel(c"startWriting")) == 0 {
             msg_void(writer, sel(c"cancelWriting"));
-            return Err(Error::EncodeError("AVAssetWriter startWriting failed".into()));
+            return Err(Error::EncodeError(
+                "AVAssetWriter startWriting failed".into(),
+            ));
         }
-        msg_set_cmtime(writer, sel(c"startSessionAtSourceTime:"), cmtime_numeric_zero());
+        msg_set_cmtime(
+            writer,
+            sel(c"startSessionAtSourceTime:"),
+            cmtime_numeric_zero(),
+        );
 
         // ── Pump samples ─────────────────────────────────────────────────
         let mut video_done = false;
@@ -688,15 +736,21 @@ unsafe fn transcode(
         // ── Finish ───────────────────────────────────────────────────────
         if msg_isize(reader, sel(c"status")) == AV_ASSET_READER_STATUS_FAILED {
             msg_void(writer, sel(c"cancelWriting"));
-            return Err(Error::DecodeError("AVAssetReader failed during reading".into()));
+            return Err(Error::DecodeError(
+                "AVAssetReader failed during reading".into(),
+            ));
         }
         if msg_isize(writer, sel(c"status")) == AV_ASSET_WRITER_STATUS_FAILED {
             msg_void(writer, sel(c"cancelWriting"));
-            return Err(Error::EncodeError("AVAssetWriter failed during writing".into()));
+            return Err(Error::EncodeError(
+                "AVAssetWriter failed during writing".into(),
+            ));
         }
         if msg_bool(writer, sel(c"finishWriting")) == 0 {
             msg_void(writer, sel(c"cancelWriting"));
-            return Err(Error::EncodeError("AVAssetWriter finishWriting failed".into()));
+            return Err(Error::EncodeError(
+                "AVAssetWriter finishWriting failed".into(),
+            ));
         }
         if msg_isize(writer, sel(c"status")) != AV_ASSET_WRITER_STATUS_COMPLETED {
             msg_void(writer, sel(c"cancelWriting"));
