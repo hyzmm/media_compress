@@ -4,6 +4,9 @@ pub mod error;
 #[cfg(target_os = "android")]
 mod android_runtime;
 
+#[cfg(all(target_os = "android", feature = "harness"))]
+mod jni_bridge;
+
 pub use compress::image::{compress_image, CompressOptions, ImageFormat};
 pub use compress::video::{compress_video, compress_video_file, VideoCompressOptions, VideoFormat};
 pub use error::Error;

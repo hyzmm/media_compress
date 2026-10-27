@@ -7,6 +7,10 @@ edition = "2021"
 name = "media_compress"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# JNI entry points used by android-test-harness; not part of the normal build.
+harness = []
+
 [dependencies]
 thiserror = "2"
 anyhow = "1"
