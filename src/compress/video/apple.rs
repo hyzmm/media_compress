@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::transform::{display_size_u32, layer_transform, CGAffineTransform};
-use super::{compute_video_target_dimensions, VideoCompressOptions, VideoFormat};
+use super::{
+    compute_video_target_dimensions, within_size_limits, H264Target, VideoCodec,
+    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome, VideoFormat,
+};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -73,6 +76,12 @@ const AUDIO_BITRATE: i32 = 128_000;
 const AV_ASSET_READER_STATUS_FAILED: isize = 3;
 const AV_ASSET_WRITER_STATUS_FAILED: isize = 3;
 const AV_ASSET_WRITER_STATUS_COMPLETED: isize = 2;
+
+/// CMFormatDescription media subtypes for the codecs accepted as-is.
+const MEDIA_SUBTYPE_AVC1: u32 = 0x6176_6331; // 'avc1'
+const MEDIA_SUBTYPE_AVC3: u32 = 0x6176_6333; // 'avc3'
+const MEDIA_SUBTYPE_HVC1: u32 = 0x6876_6331; // 'hvc1'
+const MEDIA_SUBTYPE_HEV1: u32 = 0x6865_7631; // 'hev1'
 
 // ---------------------------------------------------------------------------
 // FFI — Objective-C runtime
@@ -218,6 +227,15 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
+// FFI — CoreMedia
+// ---------------------------------------------------------------------------
+
+#[link(name = "CoreMedia", kind = "framework")]
+extern "C" {
+    fn CMFormatDescriptionGetMediaSubType(desc: CFTypeRef) -> u32;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -355,7 +373,7 @@ pub fn compress(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, 
     std::fs::write(&in_path, input)
         .map_err(|e| Error::EncodeError(format!("failed to write temp input: {e}")))?;
 
-    let result = unsafe { transcode(&in_path, &out_path, options) };
+    let result = unsafe { transcode(&in_path, &out_path, H264Target::compress(options)) };
 
     let _ = std::fs::remove_file(&in_path);
 
@@ -381,18 +399,100 @@ pub fn compress_file(
     output: &Path,
     options: VideoCompressOptions,
 ) -> Result<(), Error> {
-    unsafe { transcode(input, output, options) }
+    unsafe { transcode(input, output, H264Target::compress(options)) }
+}
+
+/// Convert `input` to H.264/MP4 unless its video track is already H.264/HEVC
+/// within the size limits.
+pub fn convert_file(
+    input: &Path,
+    output: &Path,
+    options: VideoConvertOptions,
+) -> Result<VideoConvertOutcome, Error> {
+    let probe = unsafe { probe_video(input)? };
+
+    if let Some(codec) = probe.codec {
+        if within_size_limits(probe.width, probe.height, options) {
+            return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
+        }
+    }
+
+    unsafe { transcode(input, output, H264Target::convert(options)) }?;
+    Ok(VideoConvertOutcome::Converted)
+}
+
+/// Codec and display size of the first video track.
+struct VideoProbe {
+    codec: Option<VideoCodec>,
+    width: u32,
+    height: u32,
+}
+
+unsafe fn probe_video(path: &Path) -> Result<VideoProbe, Error> {
+    let _pool = AutoreleasePool::new();
+
+    let url = file_url(path)?;
+    let result = (|| {
+        let asset = msg_id2(
+            class(c"AVURLAsset"),
+            sel(c"URLAssetWithURL:options:"),
+            url as Id,
+            std::ptr::null_mut(),
+        );
+        if asset.is_null() {
+            return Err(Error::DecodeError("AVURLAsset creation failed".into()));
+        }
+
+        let tracks = msg_id1(asset, sel(c"tracksWithMediaType:"), AVMediaTypeVideo as Id);
+        if tracks.is_null() || msg_usize(tracks, sel(c"count")) == 0 {
+            return Err(Error::DecodeError("no video track found".into()));
+        }
+
+        let track = msg_id(tracks, sel(c"firstObject"));
+        let size = msg_size(track, sel(c"naturalSize"));
+        let width = size.width.max(0.0) as u32;
+        let height = size.height.max(0.0) as u32;
+        if width == 0 || height == 0 {
+            return Err(Error::DecodeError("video track has zero dimensions".into()));
+        }
+
+        let (width, height) = display_size_u32(width, height, track_preferred_transform(track));
+
+        Ok(VideoProbe {
+            codec: video_codec(track),
+            width,
+            height,
+        })
+    })();
+    CFRelease(url);
+
+    result
+}
+
+/// `CMFormatDescription` subtype of `track`, mapped to the accepted codecs.
+unsafe fn video_codec(track: Id) -> Option<VideoCodec> {
+    let descriptions = msg_id(track, sel(c"formatDescriptions"));
+    if descriptions.is_null() || msg_usize(descriptions, sel(c"count")) == 0 {
+        return None;
+    }
+
+    let description = msg_id(descriptions, sel(c"firstObject"));
+    if description.is_null() {
+        return None;
+    }
+
+    match CMFormatDescriptionGetMediaSubType(description as CFTypeRef) {
+        MEDIA_SUBTYPE_AVC1 | MEDIA_SUBTYPE_AVC3 => Some(VideoCodec::H264),
+        MEDIA_SUBTYPE_HVC1 | MEDIA_SUBTYPE_HEV1 => Some(VideoCodec::Hevc),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Transcode implementation
 // ---------------------------------------------------------------------------
 
-unsafe fn transcode(
-    in_path: &Path,
-    out_path: &Path,
-    options: VideoCompressOptions,
-) -> Result<(), Error> {
+unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Result<(), Error> {
     let _pool = AutoreleasePool::new();
 
     let in_url = file_url(in_path)?;
@@ -431,8 +531,8 @@ unsafe fn transcode(
         let (target_w, target_h) = compute_video_target_dimensions(
             display_w,
             display_h,
-            options.max_width,
-            options.max_height,
+            target.max_width,
+            target.max_height,
         );
 
         // ── Optional audio track ─────────────────────────────────────────
@@ -590,10 +690,18 @@ unsafe fn transcode(
             return Err(Error::EncodeError("AVAssetWriter creation failed".into()));
         }
 
-        let bitrate_bps = (options.bitrate_kbps * 1000) as i32;
+        let estimated = msg_float(video_track, sel(c"estimatedDataRate"));
+        let source_bitrate_bps =
+            (estimated.is_finite() && estimated >= 1.0).then(|| estimated as u32);
+        let bitrate_bps = target.resolve_bitrate_bps(
+            source_bitrate_bps,
+            (display_w, display_h),
+            (target_w, target_h),
+            timescale as u32,
+        );
         let w_num = cf_number_i32(target_w as i32);
         let h_num = cf_number_i32(target_h as i32);
-        let bitrate_num = cf_number_i32(bitrate_bps);
+        let bitrate_num = cf_number_i32(bitrate_bps.min(i32::MAX as u32) as i32);
         let compression = cf_dictionary(
             &[AVVideoAverageBitRateKey, AVVideoProfileLevelKey],
             &[bitrate_num, AVVideoProfileLevelH264MainAutoLevel],

@@ -172,6 +172,26 @@ std::fs::write("out.mp4", out)?;
 - macOS / iOS 会把视频轨的 `preferredTransform` 应用到输出，Android 读取 `rotation-degrees` 并把帧物理旋转为正向，竖屏/旋转视频都保持正确方向；Windows 暂未处理旋转元数据。
 - 文件路径版 API `compress_video_file(input, output, options)` 直接读写文件，不把视频载入内存；产物不更小时会删除产物并返回 `false`，调用方沿用原文件。
 
+## 视频转格式（macOS / iOS / Android / Windows）
+
+`convert_video_file` 只做编码规范化，不按码率压缩；尺寸上限可选：
+
+- 视频轨已是 H.264 或 HEVC（只看编码，不看容器）且尺寸在 `max_width`/`max_height` 以内时返回 `AlreadyCompliant`，不创建输出文件，调用方沿用原文件；编码合规但超过尺寸上限仍会转码缩小。
+- 其余编码转码为 H.264 + MP4：保持源分辨率（受尺寸上限约束），码率取源视频轨的估计码率；源容器没有码率信息时按约 0.1 bit/像素/帧、限制在 1–100 Mbps 估算。发生缩小后，源码率对应的是更大的画面，输出码率会以目标分辨率的同一估算值封顶，避免小画面撑出大文件。
+- 有音轨时与压缩链路一致，重编码为 AAC。
+- 与 `compress_video_file` 相同，按文件路径流式读写、不把视频读入内存；失败时会删除写了一半的产物。
+
+```rust
+use std::path::Path;
+use media_compress::{convert_video_file, VideoConvertOptions, VideoConvertOutcome};
+
+let options = VideoConvertOptions::with_max_size(1920, 1080);
+match convert_video_file(Path::new("in.webm"), Path::new("out.mp4"), options)? {
+    VideoConvertOutcome::AlreadyCompliant(codec) => { /* 保留原文件 */ }
+    VideoConvertOutcome::Converted => { /* 使用 out.mp4 */ }
+}
+```
+
 ## Android 集成与初始化
 
 本库在 Android 平台使用两条解码链路：

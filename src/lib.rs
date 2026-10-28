@@ -8,7 +8,10 @@ mod android_runtime;
 mod jni_bridge;
 
 pub use compress::image::{compress_image, CompressOptions, ImageFormat};
-pub use compress::video::{compress_video, compress_video_file, VideoCompressOptions, VideoFormat};
+pub use compress::video::{
+    compress_video, compress_video_file, convert_video_file, VideoCodec, VideoCompressOptions,
+    VideoConvertOptions, VideoConvertOutcome, VideoFormat,
+};
 pub use error::Error;
 
 #[cfg(target_os = "android")]

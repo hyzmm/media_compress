@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::yuv::{self, CropRect};
-use super::{compute_video_target_dimensions, VideoCompressOptions};
+use super::{
+    compute_video_target_dimensions, within_size_limits, H264Target, VideoCodec,
+    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome,
+};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -332,6 +335,7 @@ struct VideoTrack {
     rotation: u32,
     frame_rate: i32,
     max_input_size: usize,
+    bitrate: Option<u32>,
 }
 
 struct AudioTrack {
@@ -381,6 +385,9 @@ unsafe fn scan_tracks(
                 rotation: normalize_rotation(format_i32(fmt.0, c"rotation-degrees").unwrap_or(0)),
                 frame_rate,
                 max_input_size,
+                bitrate: format_i32(fmt.0, c"bitrate")
+                    .filter(|value| *value > 0)
+                    .map(|value| value as u32),
             });
         } else if audio.is_none() && mime.starts_with("audio/") {
             audio = Some(AudioTrack {
@@ -413,7 +420,7 @@ pub fn compress(input: &[u8], options: VideoCompressOptions) -> Result<Vec<u8>, 
     std::fs::write(&in_path, input)
         .map_err(|e| Error::EncodeError(format!("failed to write temp input: {e}")))?;
 
-    let result = transcode(&in_path, &out_path, options);
+    let result = transcode(&in_path, &out_path, H264Target::compress(options));
 
     let _ = std::fs::remove_file(&in_path);
 
@@ -440,7 +447,76 @@ pub fn compress_file(
     output: &std::path::Path,
     options: VideoCompressOptions,
 ) -> Result<(), Error> {
-    transcode(input, output, options)
+    transcode(input, output, H264Target::compress(options))
+}
+
+/// Convert `input` to H.264/MP4 unless its video track is already H.264/HEVC
+/// within the size limits.
+pub fn convert_file(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    options: VideoConvertOptions,
+) -> Result<VideoConvertOutcome, Error> {
+    let probe = probe_video(input)?;
+
+    if let Some(codec) = probe.codec {
+        if within_size_limits(probe.width, probe.height, options) {
+            return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
+        }
+    }
+
+    transcode(input, output, H264Target::convert(options))?;
+    Ok(VideoConvertOutcome::Converted)
+}
+
+/// Codec and display size of the first video track.
+struct VideoProbe {
+    codec: Option<VideoCodec>,
+    width: u32,
+    height: u32,
+}
+
+fn probe_video(path: &std::path::Path) -> Result<VideoProbe, Error> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::DecodeError(format!("failed to open input: {e}")))?;
+    let fd = file.as_raw_fd();
+    let len = std::fs::metadata(path)
+        .map_err(|e| Error::DecodeError(format!("failed to stat input: {e}")))?
+        .len() as i64;
+
+    let extractor = {
+        let ptr = unsafe { AMediaExtractor_new() };
+        if ptr.is_null() {
+            return Err(Error::DecodeError("AMediaExtractor_new failed".into()));
+        }
+        Extractor(ptr)
+    };
+    let ret = unsafe { AMediaExtractor_setDataSourceFd(extractor.0, fd, 0, len) };
+    if ret != AMEDIA_OK {
+        return Err(Error::DecodeError(format!(
+            "AMediaExtractor_setDataSourceFd failed: {ret}"
+        )));
+    }
+
+    let (video_track, _) = unsafe { scan_tracks(extractor.0)? };
+    let (width, height) = match video_track.rotation {
+        90 | 270 => (video_track.crop.height, video_track.crop.width),
+        _ => (video_track.crop.width, video_track.crop.height),
+    };
+
+    Ok(VideoProbe {
+        codec: video_codec(&video_track.mime),
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
+fn video_codec(mime: &str) -> Option<VideoCodec> {
+    match mime {
+        "video/avc" => Some(VideoCodec::H264),
+        "video/hevc" => Some(VideoCodec::Hevc),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +539,7 @@ fn unique_temp_path(ext: &str) -> PathBuf {
 fn transcode(
     in_path: &std::path::Path,
     out_path: &std::path::Path,
-    options: VideoCompressOptions,
+    target: H264Target,
 ) -> Result<(), Error> {
     let in_file = std::fs::File::open(in_path)
         .map_err(|e| Error::DecodeError(format!("failed to open input: {e}")))?;
@@ -476,7 +552,7 @@ fn transcode(
         .map_err(|e| Error::EncodeError(format!("failed to create output: {e}")))?;
     let out_fd = out_file.into_raw_fd();
 
-    let result = unsafe { transcode_fd(in_fd, in_len, out_fd, options) };
+    let result = unsafe { transcode_fd(in_fd, in_len, out_fd, target) };
 
     // The muxer is deleted by the time transcode_fd returns, so our descriptor
     // can be released regardless of whether the muxer duplicated it.
@@ -554,7 +630,7 @@ unsafe fn transcode_fd(
     in_fd: i32,
     in_len: i64,
     out_fd: i32,
-    options: VideoCompressOptions,
+    target: H264Target,
 ) -> Result<(), Error> {
     let extractor = {
         let ptr = AMediaExtractor_new();
@@ -580,10 +656,16 @@ unsafe fn transcode_fd(
     let (target_w, target_h) = compute_video_target_dimensions(
         display_w as u32,
         display_h as u32,
-        options.max_width,
-        options.max_height,
+        target.max_width,
+        target.max_height,
     );
     let (target_w, target_h) = (target_w as usize, target_h as usize);
+    let bitrate_bps = target.resolve_bitrate_bps(
+        video_track.bitrate,
+        (display_w as u32, display_h as u32),
+        (target_w as u32, target_h as u32),
+        video_track.frame_rate as u32,
+    );
 
     AMediaExtractor_selectTrack(extractor.0, video_track.index);
     if let Some(track) = &audio_track {
@@ -594,12 +676,8 @@ unsafe fn transcode_fd(
     configure_from_track(&video_decoder, extractor.0, video_track.index)?;
     start_codec(&video_decoder, "video decoder")?;
 
-    let (video_encoder, encoder_color_format) = create_video_encoder(
-        target_w,
-        target_h,
-        video_track.frame_rate,
-        options.bitrate_kbps,
-    )?;
+    let (video_encoder, encoder_color_format) =
+        create_video_encoder(target_w, target_h, video_track.frame_rate, bitrate_bps)?;
 
     let audio_decoder = match &audio_track {
         Some(track) => {
@@ -1040,11 +1118,9 @@ fn create_video_encoder(
     target_w: usize,
     target_h: usize,
     frame_rate: i32,
-    bitrate_kbps: u32,
+    bitrate_bps: u32,
 ) -> Result<(Codec, i32), Error> {
-    let bitrate = bitrate_kbps
-        .saturating_mul(1000)
-        .clamp(100_000, i32::MAX as u32) as i32;
+    let bitrate = bitrate_bps.clamp(100_000, i32::MAX as u32) as i32;
     let candidates: [Option<&CStr>; 3] = [
         None,
         Some(c"c2.android.avc.encoder"),
