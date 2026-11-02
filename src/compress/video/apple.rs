@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::transform::{display_size_u32, layer_transform, CGAffineTransform};
 use super::{
-    compute_video_target_dimensions, within_size_limits, H264Target, VideoCodec,
-    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome, VideoFormat,
+    compliant_codec, compute_video_target_dimensions, H264Target, VideoCodec, VideoCompressOptions,
+    VideoConvertOptions, VideoConvertOutcome, VideoFormat,
 };
 use crate::error::Error;
 
@@ -77,7 +77,7 @@ const AV_ASSET_READER_STATUS_FAILED: isize = 3;
 const AV_ASSET_WRITER_STATUS_FAILED: isize = 3;
 const AV_ASSET_WRITER_STATUS_COMPLETED: isize = 2;
 
-/// CMFormatDescription media subtypes for the codecs accepted as-is.
+/// CMFormatDescription media subtypes the probe recognises on a source track.
 const MEDIA_SUBTYPE_AVC1: u32 = 0x6176_6331; // 'avc1'
 const MEDIA_SUBTYPE_AVC3: u32 = 0x6176_6333; // 'avc3'
 const MEDIA_SUBTYPE_HVC1: u32 = 0x6876_6331; // 'hvc1'
@@ -402,8 +402,8 @@ pub fn compress_file(
     unsafe { transcode(input, output, H264Target::compress(options)) }
 }
 
-/// Convert `input` to H.264/MP4 unless its video track is already H.264/HEVC
-/// within the size limits.
+/// Convert `input` to H.264/MP4 unless its video track is already H.264 within
+/// the size limits. HEVC is re-encoded like any other codec.
 pub fn convert_file(
     input: &Path,
     output: &Path,
@@ -411,10 +411,8 @@ pub fn convert_file(
 ) -> Result<VideoConvertOutcome, Error> {
     let probe = unsafe { probe_video(input)? };
 
-    if let Some(codec) = probe.codec {
-        if within_size_limits(probe.width, probe.height, options) {
-            return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
-        }
+    if let Some(codec) = compliant_codec(probe.codec, probe.width, probe.height, options) {
+        return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
     }
 
     unsafe { transcode(input, output, H264Target::convert(options)) }?;
@@ -469,7 +467,7 @@ unsafe fn probe_video(path: &Path) -> Result<VideoProbe, Error> {
     result
 }
 
-/// `CMFormatDescription` subtype of `track`, mapped to the accepted codecs.
+/// `CMFormatDescription` subtype of `track`, mapped to the recognised codecs.
 unsafe fn video_codec(track: Id) -> Option<VideoCodec> {
     let descriptions = msg_id(track, sel(c"formatDescriptions"));
     if descriptions.is_null() || msg_usize(descriptions, sel(c"count")) == 0 {

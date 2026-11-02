@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::yuv::{self, CropRect};
 use super::{
-    compute_video_target_dimensions, within_size_limits, H264Target, VideoCodec,
-    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome,
+    compliant_codec, compute_video_target_dimensions, H264Target, VideoCodec, VideoCompressOptions,
+    VideoConvertOptions, VideoConvertOutcome,
 };
 use crate::error::Error;
 
@@ -450,8 +450,8 @@ pub fn compress_file(
     transcode(input, output, H264Target::compress(options))
 }
 
-/// Convert `input` to H.264/MP4 unless its video track is already H.264/HEVC
-/// within the size limits.
+/// Convert `input` to H.264/MP4 unless its video track is already H.264 within
+/// the size limits. HEVC is re-encoded like any other codec.
 pub fn convert_file(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -459,10 +459,8 @@ pub fn convert_file(
 ) -> Result<VideoConvertOutcome, Error> {
     let probe = probe_video(input)?;
 
-    if let Some(codec) = probe.codec {
-        if within_size_limits(probe.width, probe.height, options) {
-            return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
-        }
+    if let Some(codec) = compliant_codec(probe.codec, probe.width, probe.height, options) {
+        return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
     }
 
     transcode(input, output, H264Target::convert(options))?;
@@ -511,6 +509,7 @@ fn probe_video(path: &std::path::Path) -> Result<VideoProbe, Error> {
     })
 }
 
+/// Map a source track mime to the codecs the probe recognises.
 fn video_codec(mime: &str) -> Option<VideoCodec> {
     match mime {
         "video/avc" => Some(VideoCodec::H264),

@@ -1,14 +1,12 @@
-// Native-only integration tests: H.264/HEVC detection and transcoding go
-// through the platform media stack, which does not exist on wasm32.
+// Native-only integration tests: codec detection and transcoding go through
+// the platform media stack, which does not exist on wasm32.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use media_compress::{
-    convert_video_file, VideoCodec, VideoConvertOptions, VideoConvertOutcome,
-};
+use media_compress::{convert_video_file, VideoCodec, VideoConvertOptions, VideoConvertOutcome};
 
 fn is_mp4(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
@@ -36,9 +34,10 @@ fn input_dir() -> PathBuf {
 /// Convert every video under `test_videos/` and write results to
 /// `out_videos/converted/`.
 ///
-/// H.264/HEVC sources must be reported as already compliant without creating
-/// an output; every other recognised source must produce an MP4. Fixtures are
-/// not committed, so the test only asserts that at least one file was handled.
+/// Only H.264 sources are reported as already compliant without creating an
+/// output; every other recognised source — HEVC included — must produce an MP4.
+/// Fixtures are not committed, so the test only asserts that at least one file
+/// was handled.
 #[test]
 fn convert_all_test_videos() {
     let input_dir = input_dir();
@@ -115,6 +114,61 @@ fn convert_all_test_videos() {
 
     assert!(converted + compliant > 0, "no video fixtures were handled");
     eprintln!("converted: {converted}, already compliant: {compliant}");
+}
+
+/// HEVC is not kept as-is: it is re-encoded to H.264/MP4 even when the frame
+/// already fits. Converting the output a second time proves it really became
+/// H.264 — a track that is now reported as already compliant.
+///
+/// Platforms without an HEVC *decoder* (a Windows install missing the HEVC
+/// extension, for example) cannot read the source at all; that is a source
+/// limitation and is reported as a skip rather than a failure.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
+#[test]
+fn hevc_input_is_transcoded_to_h264() {
+    let hevc = input_dir().join("convert_hevc.mp4");
+    if !hevc.exists() {
+        eprintln!("convert_hevc.mp4 fixture not present — skipping test");
+        return;
+    }
+
+    let dir = temp_dir("hevc_to_h264");
+    let out = dir.join("converted.mp4");
+
+    match convert_video_file(&hevc, &out, VideoConvertOptions::new()) {
+        Ok(VideoConvertOutcome::Converted) => {}
+        Ok(other) => panic!("HEVC input must be transcoded, got {other:?}"),
+        Err(media_compress::Error::DecodeError(msg))
+        | Err(media_compress::Error::PlatformNotSupported(msg)) => {
+            eprintln!("  SKIP     no HEVC decoder available: {msg}");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        Err(e) => panic!("convert_video_file failed on HEVC input: {e}"),
+    }
+
+    assert!(
+        is_mp4(&fs::read(&out).unwrap()),
+        "HEVC conversion must write an MP4"
+    );
+
+    let second_out = dir.join("second.mp4");
+    assert_eq!(
+        convert_video_file(&out, &second_out, VideoConvertOptions::new()).unwrap(),
+        VideoConvertOutcome::AlreadyCompliant(VideoCodec::H264),
+        "the converted output must now be H.264"
+    );
+    assert!(
+        !second_out.exists(),
+        "an H.264 output must not be rewritten on the second pass"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A compliant codec still needs a re-encode when the frame exceeds the size

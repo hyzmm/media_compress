@@ -132,7 +132,7 @@ impl VideoConvertOptions {
     }
 }
 
-/// Video codecs that [`convert_video_file`] accepts without re-encoding.
+/// Video codecs the platform probes recognise on the source track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
     H264,
@@ -142,8 +142,8 @@ pub enum VideoCodec {
 /// Outcome of [`convert_video_file`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoConvertOutcome {
-    /// The video track already uses H.264 or HEVC within the size limits; no
-    /// output was written.
+    /// The video track already uses H.264 within the size limits; no output was
+    /// written. Always carries [`VideoCodec::H264`].
     AlreadyCompliant(VideoCodec),
     /// The source was transcoded to H.264/MP4 at the output path.
     Converted,
@@ -217,6 +217,27 @@ impl H264Target {
 pub(crate) fn within_size_limits(width: u32, height: u32, options: VideoConvertOptions) -> bool {
     options.max_width.map_or(true, |max| width <= max)
         && options.max_height.map_or(true, |max| height <= max)
+}
+
+/// The probed codec when the source can be kept as-is, `None` when it must be
+/// transcoded to H.264.
+///
+/// Only H.264 within the size limits is kept. HEVC is deliberately not
+/// accepted — every output of [`convert_video_file`] is H.264/MP4, so an HEVC
+/// source is re-encoded like any other codec. The container is not part of the
+/// decision: an H.264 track in a MOV/MP4 within the limits is left untouched.
+pub(crate) fn compliant_codec(
+    codec: Option<VideoCodec>,
+    width: u32,
+    height: u32,
+    options: VideoConvertOptions,
+) -> Option<VideoCodec> {
+    match codec {
+        Some(VideoCodec::H264) if within_size_limits(width, height, options) => {
+            Some(VideoCodec::H264)
+        }
+        _ => None,
+    }
 }
 
 /// Compute target dimensions that fit within `max_width`/`max_height`,
@@ -311,7 +332,10 @@ pub fn compress_video_file(
 }
 
 /// Convert a video file to H.264/MP4 unless its video track is already H.264
-/// or HEVC within the size limits.
+/// within the size limits.
+///
+/// HEVC is transcoded like any other codec: H.264 is the only encoding kept
+/// as-is.
 ///
 /// This is a codec normalization step, not a size-driven compression: the
 /// output keeps the source resolution, capped by
@@ -516,7 +540,8 @@ fn convert_video_file_platform(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_video_target_dimensions, within_size_limits, H264Target, VideoConvertOptions,
+        compliant_codec, compute_video_target_dimensions, within_size_limits, H264Target,
+        VideoCodec, VideoConvertOptions,
     };
 
     #[test]
@@ -585,6 +610,41 @@ mod tests {
         assert!(!within_size_limits(1080, 1920, limited));
         // 未设置上限时任何尺寸都算合规
         assert!(within_size_limits(7680, 4320, VideoConvertOptions::new()));
+    }
+
+    #[test]
+    fn only_h264_is_kept_and_hevc_is_transcoded() {
+        let unlimited = VideoConvertOptions::new();
+
+        assert_eq!(
+            compliant_codec(Some(VideoCodec::H264), 1920, 1080, unlimited),
+            Some(VideoCodec::H264)
+        );
+        // HEVC 不再免转码，无论尺寸
+        assert_eq!(
+            compliant_codec(Some(VideoCodec::Hevc), 1920, 1080, unlimited),
+            None
+        );
+        assert_eq!(
+            compliant_codec(Some(VideoCodec::Hevc), 640, 360, unlimited),
+            None
+        );
+        // 探测不出编码时同样走转码
+        assert_eq!(compliant_codec(None, 640, 360, unlimited), None);
+    }
+
+    #[test]
+    fn h264_over_the_size_limit_is_transcoded() {
+        let limited = VideoConvertOptions::with_max_size(1920, 1080);
+
+        assert_eq!(
+            compliant_codec(Some(VideoCodec::H264), 3840, 2160, limited),
+            None
+        );
+        assert_eq!(
+            compliant_codec(Some(VideoCodec::H264), 1920, 1080, limited),
+            Some(VideoCodec::H264)
+        );
     }
 
     #[test]

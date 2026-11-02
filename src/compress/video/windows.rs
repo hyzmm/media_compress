@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::rgb;
 use super::{
-    compute_video_target_dimensions, within_size_limits, H264Target, VideoCodec,
-    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome, VideoFormat,
+    compliant_codec, compute_video_target_dimensions, H264Target, VideoCodec, VideoCompressOptions,
+    VideoConvertOptions, VideoConvertOutcome, VideoFormat,
 };
 use crate::error::Error;
 
@@ -376,7 +376,7 @@ fn guid_eq(a: &GUID, b: &GUID) -> bool {
     a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
 }
 
-/// Map a native video subtype to the codecs the converter accepts as-is.
+/// Map a native video subtype to the codecs the probe recognises.
 fn video_codec(subtype: &GUID) -> Option<VideoCodec> {
     if guid_eq(subtype, &MF_VIDEO_FORMAT_H264) {
         Some(VideoCodec::H264)
@@ -673,8 +673,8 @@ pub fn compress_file(
     transcode(input, output, H264Target::compress(options))
 }
 
-/// Convert `input` to H.264/MP4 unless its video track is already H.264/HEVC
-/// within the size limits.
+/// Convert `input` to H.264/MP4 unless its video track is already H.264 within
+/// the size limits. HEVC is re-encoded like any other codec.
 pub fn convert_file(
     input: &Path,
     output: &Path,
@@ -682,10 +682,8 @@ pub fn convert_file(
 ) -> Result<VideoConvertOutcome, Error> {
     let probe = probe_video(input)?;
 
-    if let Some(codec) = probe.codec {
-        if within_size_limits(probe.width, probe.height, options) {
-            return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
-        }
+    if let Some(codec) = compliant_codec(probe.codec, probe.width, probe.height, options) {
+        return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
     }
 
     transcode(input, output, H264Target::convert(options))?;
