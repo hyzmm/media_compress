@@ -82,6 +82,17 @@ const MF_AUDIO_FORMAT_AAC: GUID = fourcc_guid(0x0000_1610);
 /// MFAudioFormat_PCM (WAVE_FORMAT_PCM = 1).
 const MF_AUDIO_FORMAT_PCM: GUID = fourcc_guid(0x0000_0001);
 
+// Source reader attribute (defined in mfreadwrite.h). Without it the source
+// reader refuses non-native output types such as RGB32 with
+// MF_E_INVALIDMEDIATYPE (0xC00D36B4), because it will not insert the Video
+// Processor MFT on its own.
+const MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING: GUID = GUID {
+    data1: 0xfb394f3d,
+    data2: 0xccf1,
+    data3: 0x42ee,
+    data4: [0xbb, 0xb3, 0xf9, 0xb8, 0x45, 0xd5, 0x68, 0x1d],
+};
+
 // Media type attribute GUIDs (defined in mfapi.h).
 const MF_MT_MAJOR_TYPE: GUID = GUID {
     data1: 0x48eba18e,
@@ -196,6 +207,7 @@ unsafe fn release_com(p: *mut c_void) {
 extern "system" {
     fn MFStartup(version: u32, flags: u32) -> HRESULT;
     fn MFShutdown() -> HRESULT;
+    fn MFCreateAttributes(pp_attributes: *mut *mut c_void, initial_size: u32) -> HRESULT;
     fn MFCreateMediaType(pp_mt: *mut *mut c_void) -> HRESULT;
     fn MFCreateMemoryBuffer(max_length: u32, pp_buffer: *mut *mut c_void) -> HRESULT;
     fn MFCreateSample(pp_sample: *mut *mut c_void) -> HRESULT;
@@ -220,12 +232,14 @@ extern "system" {
 // Attribute helpers (IMFMediaType inherits IMFAttributes)
 // ---------------------------------------------------------------------------
 
-// IMFAttributes vtable slots: GetUINT32=7, GetUINT64=8, SetUINT32=20,
-// SetUINT64=21, SetGUID=23.
+// IMFAttributes vtable slots, counted from the interface returned by
+// `offsetof(IMFAttributesVtbl, ...) / sizeof(void*)` in the Windows SDK
+// (mfobjects.h): GetUINT32=7, GetUINT64=8, GetGUID=10, SetUINT32=21,
+// SetUINT64=22, SetGUID=24.
 unsafe fn attr_set_guid(p: *mut c_void, key: &GUID, value: &GUID) -> HRESULT {
     com_call!(
         p,
-        23,
+        24,
         unsafe extern "system" fn(*mut c_void, *const GUID, *const GUID) -> HRESULT,
         key,
         value
@@ -235,7 +249,7 @@ unsafe fn attr_set_guid(p: *mut c_void, key: &GUID, value: &GUID) -> HRESULT {
 unsafe fn attr_set_u32(p: *mut c_void, key: &GUID, value: u32) -> HRESULT {
     com_call!(
         p,
-        20,
+        21,
         unsafe extern "system" fn(*mut c_void, *const GUID, u32) -> HRESULT,
         key,
         value
@@ -245,7 +259,7 @@ unsafe fn attr_set_u32(p: *mut c_void, key: &GUID, value: u32) -> HRESULT {
 unsafe fn attr_set_u64(p: *mut c_void, key: &GUID, value: u64) -> HRESULT {
     com_call!(
         p,
-        21,
+        22,
         unsafe extern "system" fn(*mut c_void, *const GUID, u64) -> HRESULT,
         key,
         value
@@ -306,26 +320,49 @@ unsafe fn attr_get_guid(p: *mut c_void, key: &GUID) -> Result<GUID, HRESULT> {
 }
 
 // MF_MT_FRAME_SIZE / MF_MT_FRAME_RATE / MF_MT_PIXEL_ASPECT_RATIO are packed
-// UINT64 values (width / numerator in the low 32 bits, height / denominator in
-// the high 32 bits). The MFSetAttributeSize / MFGetAttributeSize / ... helpers
-// are inline wrappers over SetUINT64 / GetUINT64 in mfapi.h, NOT exported from
+// UINT64 values. Following `Pack2UINT32AsUINT64` in mfapi.h, the FIRST value
+// (width / numerator) goes in the HIGH 32 bits and the second (height /
+// denominator) in the low 32 bits:
+//   MFSetAttributeSize(mt, key, w, h)   -> (w << 32) | h
+//   MFSetAttributeRatio(mt, key, n, d)  -> (n << 32) | d
+// The MFSetAttributeSize / MFGetAttributeSize / ... helpers are inline
+// wrappers over SetUINT64 / GetUINT64 in mfapi.h, NOT exported from
 // mfplat.dll, so reimplement the packing here.
+
+/// Pack a frame size the way `MFSetAttributeSize` does.
+fn pack_size(width: u32, height: u32) -> u64 {
+    ((width as u64) << 32) | height as u64
+}
+
+/// Inverse of [`pack_size`].
+fn unpack_size(value: u64) -> (u32, u32) {
+    ((value >> 32) as u32, value as u32)
+}
+
+/// Pack a ratio the way `MFSetAttributeRatio` does.
+fn pack_ratio(numerator: u32, denominator: u32) -> u64 {
+    ((numerator as u64) << 32) | denominator as u64
+}
+
+/// Inverse of [`pack_ratio`].
+fn unpack_ratio(value: u64) -> (u32, u32) {
+    ((value >> 32) as u32, value as u32)
+}
+
 unsafe fn attr_set_size(p: *mut c_void, key: &GUID, w: u32, h: u32) -> HRESULT {
-    attr_set_u64(p, key, (w as u64) | ((h as u64) << 32))
+    attr_set_u64(p, key, pack_size(w, h))
 }
 
 unsafe fn attr_set_ratio(p: *mut c_void, key: &GUID, num: u32, den: u32) -> HRESULT {
-    attr_set_u64(p, key, (num as u64) | ((den as u64) << 32))
+    attr_set_u64(p, key, pack_ratio(num, den))
 }
 
 unsafe fn attr_get_size(p: *mut c_void, key: &GUID) -> Result<(u32, u32), HRESULT> {
-    let v = attr_get_u64(p, key)?;
-    Ok((v as u32, (v >> 32) as u32))
+    attr_get_u64(p, key).map(unpack_size)
 }
 
 unsafe fn attr_get_ratio(p: *mut c_void, key: &GUID) -> Result<(u32, u32), HRESULT> {
-    let v = attr_get_u64(p, key)?;
-    Ok((v as u32, (v >> 32) as u32))
+    attr_get_u64(p, key).map(unpack_ratio)
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +440,30 @@ unsafe fn new_media_type() -> Result<*mut c_void, Error> {
         return Err(err_encode("MFCreateMediaType", hr));
     }
     Ok(mt)
+}
+
+/// Attributes passed to `MFCreateSourceReaderFromURL`.
+///
+/// `MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING` makes the source reader insert
+/// the Video Processor MFT, which is what converts a decoded NV12/P010 frame
+/// to the RGB32 type this backend asks for. Without it `SetCurrentMediaType`
+/// fails with `MF_E_INVALIDMEDIATYPE` (0xC00D36B4) for every codec, HEVC
+/// included.
+unsafe fn source_reader_attributes() -> Result<*mut c_void, Error> {
+    let mut attrs: *mut c_void = std::ptr::null_mut();
+    let hr = MFCreateAttributes(&mut attrs, 1);
+    if !hres_ok(hr) || attrs.is_null() {
+        return Err(err_decode("MFCreateAttributes", hr));
+    }
+    let hr = attr_set_u32(attrs, &MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1);
+    if !hres_ok(hr) {
+        release_com(attrs);
+        return Err(err_decode(
+            "set MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING",
+            hr,
+        ));
+    }
+    Ok(attrs)
 }
 
 /// Media type for decoding video as RGB32 at the source resolution.
@@ -774,8 +835,12 @@ fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Result<(), 
 
 unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) -> Result<(), Error> {
     // ── Source reader ────────────────────────────────────────────────────
+    // The reader needs video processing enabled up front: RGB32 output is only
+    // reachable through the Video Processor MFT.
+    let reader_attrs = source_reader_attributes()?;
     let mut reader: *mut c_void = std::ptr::null_mut();
-    let hr = MFCreateSourceReaderFromURL(in_url.as_ptr(), std::ptr::null_mut(), &mut reader);
+    let hr = MFCreateSourceReaderFromURL(in_url.as_ptr(), reader_attrs, &mut reader);
+    release_com(reader_attrs);
     if !hres_ok(hr) || reader.is_null() {
         return Err(err_decode("MFCreateSourceReaderFromURL", hr));
     }
@@ -974,7 +1039,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
         }
     }
 
-    let hr = com_call!(writer, 6, unsafe extern "system" fn(*mut c_void) -> HRESULT);
+    let hr = com_call!(writer, 5, unsafe extern "system" fn(*mut c_void) -> HRESULT);
     if !hres_ok(hr) {
         release_com(writer);
         release_com(reader);
@@ -1032,7 +1097,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
                 let (sample, _ts) = audio_pending.take().unwrap();
                 let hr = com_call!(
                     writer,
-                    7,
+                    6,
                     unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> HRESULT,
                     audio_stream,
                     sample
@@ -1053,7 +1118,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
     }
 
     // ── Finalize ─────────────────────────────────────────────────────────
-    let hr = com_call!(writer, 12, unsafe extern "system" fn(*mut c_void) -> HRESULT);
+    let hr = com_call!(writer, 11, unsafe extern "system" fn(*mut c_void) -> HRESULT);
     release_com(writer);
     release_com(reader);
     if !hres_ok(hr) {
@@ -1116,13 +1181,14 @@ unsafe fn write_video_sample(
     target_h: usize,
     fps: i64,
 ) -> Result<(), Error> {
-    // IMFSample slots: GetSampleTime=34, SetSampleTime=35, GetSampleDuration=36,
-    // SetSampleDuration=37, GetBufferByIndex=39, ConvertToContiguousBuffer=40,
-    // AddBuffer=41.
+    // IMFSample vtable slots (from the Windows SDK, mfobjects.h):
+    // GetSampleTime=35, SetSampleTime=36, GetSampleDuration=37,
+    // SetSampleDuration=38, GetBufferByIndex=40,
+    // ConvertToContiguousBuffer=41, AddBuffer=42.
     let mut duration: i64 = 0;
     com_call!(
         sample,
-        36,
+        37,
         unsafe extern "system" fn(*mut c_void, *mut i64) -> HRESULT,
         &mut duration
     );
@@ -1133,7 +1199,7 @@ unsafe fn write_video_sample(
     let mut buffer: *mut c_void = std::ptr::null_mut();
     let hr = com_call!(
         sample,
-        39,
+        40,
         unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
         0u32,
         &mut buffer
@@ -1148,7 +1214,7 @@ unsafe fn write_video_sample(
     let mut contiguous: *mut c_void = std::ptr::null_mut();
     let hr = com_call!(
         sample,
-        40,
+        41,
         unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
         &mut contiguous
     );
@@ -1241,7 +1307,7 @@ unsafe fn write_video_sample(
 
     let hr = com_call!(
         out_sample,
-        41,
+        42,
         unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
         out_buffer
     );
@@ -1253,20 +1319,20 @@ unsafe fn write_video_sample(
 
     com_call!(
         out_sample,
-        35,
+        36,
         unsafe extern "system" fn(*mut c_void, i64) -> HRESULT,
         ts
     );
     com_call!(
         out_sample,
-        37,
+        38,
         unsafe extern "system" fn(*mut c_void, i64) -> HRESULT,
         duration
     );
 
     let hr = com_call!(
         writer,
-        7,
+        6,
         unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> HRESULT,
         stream,
         out_sample
@@ -1277,4 +1343,30 @@ unsafe fn write_video_sample(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pack_ratio, pack_size, unpack_ratio, unpack_size};
+
+    /// Values observed from `MF_MT_FRAME_SIZE` on a 480x640 source: Media
+    /// Foundation puts the width in the high dword.
+    #[test]
+    fn frame_size_packs_width_in_the_high_dword() {
+        assert_eq!(pack_size(480, 640), 0x0000_01E0_0000_0280);
+        assert_eq!(unpack_size(0x0000_01E0_0000_0280), (480, 640));
+    }
+
+    /// `MF_MT_FRAME_RATE` for 30/1 is 0x0000001E00000001: numerator high.
+    #[test]
+    fn frame_rate_packs_numerator_in_the_high_dword() {
+        assert_eq!(pack_ratio(30, 1), 0x0000_001E_0000_0001);
+        assert_eq!(unpack_ratio(0x0000_001E_0000_0001), (30, 1));
+    }
+
+    #[test]
+    fn pack_round_trips_arbitrary_values() {
+        assert_eq!(unpack_size(pack_size(1918, 1078)), (1918, 1078));
+        assert_eq!(unpack_ratio(pack_ratio(30000, 1001)), (30000, 1001));
+    }
 }
