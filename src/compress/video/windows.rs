@@ -77,6 +77,8 @@ const MF_VIDEO_FORMAT_H264: GUID = fourcc_guid(0x3436_3248);
 const MF_VIDEO_FORMAT_HEVC: GUID = fourcc_guid(0x4356_4548);
 /// MFVideoFormat_RGB32 (D3DFMT_X8R8G8B8 = 22).
 const MF_VIDEO_FORMAT_RGB32: GUID = fourcc_guid(0x0000_0016);
+/// MFVideoFormat_NV12 ('NV12').
+const MF_VIDEO_FORMAT_NV12: GUID = fourcc_guid(0x3231_564e);
 /// MFAudioFormat_AAC (WAVE_FORMAT_MPEG_HEAAC = 0x1610).
 const MF_AUDIO_FORMAT_AAC: GUID = fourcc_guid(0x0000_1610);
 /// MFAudioFormat_PCM (WAVE_FORMAT_PCM = 1).
@@ -172,6 +174,24 @@ const MF_MT_AUDIO_BITS_PER_SAMPLE: GUID = GUID {
     data3: 0x4764,
     data4: [0xaa, 0x33, 0xed, 0x4f, 0x2d, 0x1f, 0xf6, 0x69],
 };
+const MF_MT_YUV_MATRIX: GUID = GUID {
+    data1: 0x3e23d450,
+    data2: 0x2c75,
+    data3: 0x4d25,
+    data4: [0xa0, 0x0e, 0xb9, 0x16, 0x70, 0xd1, 0x23, 0x27],
+};
+const MF_MT_VIDEO_NOMINAL_RANGE: GUID = GUID {
+    data1: 0xc21b8ee5,
+    data2: 0xb956,
+    data3: 0x4071,
+    data4: [0x8d, 0xaf, 0x32, 0x5e, 0xdf, 0x5c, 0xab, 0x11],
+};
+
+// MFVideoTransferMatrix_* (mfobjects.h).
+const MF_VIDEO_TRANSFER_MATRIX_BT601: u32 = 2;
+const MF_VIDEO_TRANSFER_MATRIX_BT709: u32 = 1;
+// MFNominalRange_0_255 (mfobjects.h). 16_235 and Unknown both mean video range.
+const MF_NOMINAL_RANGE_0_255: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // COM vtable helpers
@@ -442,13 +462,13 @@ unsafe fn new_media_type() -> Result<*mut c_void, Error> {
     Ok(mt)
 }
 
-/// Attributes passed to `MFCreateSourceReaderFromURL`.
+/// Attributes for the fallback Video Processor pipeline.
 ///
 /// `MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING` makes the source reader insert
-/// the Video Processor MFT, which is what converts a decoded NV12/P010 frame
-/// to the RGB32 type this backend asks for. Without it `SetCurrentMediaType`
-/// fails with `MF_E_INVALIDMEDIATYPE` (0xC00D36B4) for every codec, HEVC
-/// included.
+/// the Video Processor MFT, which converts the decoder's P010/NV12 output to
+/// the RGB32 type this backend asks for. It is only used when the decoder's
+/// native output cannot be recognised (10-bit sources and the like); without
+/// it `SetCurrentMediaType` fails with `MF_E_INVALIDMEDIATYPE` (0xC00D36B4).
 unsafe fn source_reader_attributes() -> Result<*mut c_void, Error> {
     let mut attrs: *mut c_void = std::ptr::null_mut();
     let hr = MFCreateAttributes(&mut attrs, 1);
@@ -490,6 +510,30 @@ unsafe fn source_rgb32_type(src_w: u32, src_h: u32) -> Result<*mut c_void, Error
     }
 }
 
+/// Media type for decoding video as NV12 at the source resolution.
+unsafe fn source_nv12_type(src_w: u32, src_h: u32) -> Result<*mut c_void, Error> {
+    let mt = new_media_type()?;
+    let r = (|| {
+        if !hres_ok(attr_set_guid(mt, &MF_MT_MAJOR_TYPE, &MF_MEDIA_TYPE_VIDEO)) {
+            return Err(err_decode("set MF_MT_MAJOR_TYPE", -1));
+        }
+        if !hres_ok(attr_set_guid(mt, &MF_MT_SUBTYPE, &MF_VIDEO_FORMAT_NV12)) {
+            return Err(err_decode("set MF_MT_SUBTYPE (NV12)", -1));
+        }
+        if !hres_ok(attr_set_size(mt, &MF_MT_FRAME_SIZE, src_w, src_h)) {
+            return Err(err_decode("set MF_MT_FRAME_SIZE", -1));
+        }
+        Ok(())
+    })();
+    match r {
+        Ok(()) => Ok(mt),
+        Err(e) => {
+            release_com(mt);
+            Err(e)
+        }
+    }
+}
+
 /// Media type for decoding audio as 16-bit stereo PCM at 44.1 kHz.
 unsafe fn source_pcm_type() -> Result<*mut c_void, Error> {
     let mt = new_media_type()?;
@@ -510,10 +554,18 @@ unsafe fn source_pcm_type() -> Result<*mut c_void, Error> {
         )) {
             return Err(err_decode("set MF_MT_AUDIO_SAMPLES_PER_SECOND", -1));
         }
-        if !hres_ok(attr_set_u32(mt, &MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS_PER_SAMPLE)) {
+        if !hres_ok(attr_set_u32(
+            mt,
+            &MF_MT_AUDIO_BITS_PER_SAMPLE,
+            AUDIO_BITS_PER_SAMPLE,
+        )) {
             return Err(err_decode("set MF_MT_AUDIO_BITS_PER_SAMPLE", -1));
         }
-        if !hres_ok(attr_set_u32(mt, &MF_MT_AUDIO_BLOCK_ALIGNMENT, AUDIO_BLOCK_ALIGNMENT)) {
+        if !hres_ok(attr_set_u32(
+            mt,
+            &MF_MT_AUDIO_BLOCK_ALIGNMENT,
+            AUDIO_BLOCK_ALIGNMENT,
+        )) {
             return Err(err_decode("set MF_MT_AUDIO_BLOCK_ALIGNMENT", -1));
         }
         Ok(())
@@ -670,10 +722,18 @@ unsafe fn pcm_input_type() -> Result<*mut c_void, Error> {
         )) {
             return Err(err_encode("set MF_MT_AUDIO_SAMPLES_PER_SECOND", -1));
         }
-        if !hres_ok(attr_set_u32(mt, &MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS_PER_SAMPLE)) {
+        if !hres_ok(attr_set_u32(
+            mt,
+            &MF_MT_AUDIO_BITS_PER_SAMPLE,
+            AUDIO_BITS_PER_SAMPLE,
+        )) {
             return Err(err_encode("set MF_MT_AUDIO_BITS_PER_SAMPLE", -1));
         }
-        if !hres_ok(attr_set_u32(mt, &MF_MT_AUDIO_BLOCK_ALIGNMENT, AUDIO_BLOCK_ALIGNMENT)) {
+        if !hres_ok(attr_set_u32(
+            mt,
+            &MF_MT_AUDIO_BLOCK_ALIGNMENT,
+            AUDIO_BLOCK_ALIGNMENT,
+        )) {
             return Err(err_encode("set MF_MT_AUDIO_BLOCK_ALIGNMENT", -1));
         }
         if !hres_ok(attr_set_u32(
@@ -692,6 +752,294 @@ unsafe fn pcm_input_type() -> Result<*mut c_void, Error> {
             Err(e)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Source reader setup
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum DecodeStrategy {
+    /// Read the decoder's native NV12 output and convert to BGRA on the CPU.
+    Native,
+    /// Let the source reader insert the Video Processor MFT and hand back
+    /// packed RGB32 at the source resolution.
+    VideoProcessor,
+}
+
+/// Layout of the buffers a decoder actually emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodedLayout {
+    /// 32-bpp BGRX (the memory layout of `MFVideoFormat_RGB32`).
+    Bgra { stride: usize },
+    /// NV12: full-size Y plane, then interleaved UV at half height.
+    Nv12 { stride: usize },
+}
+
+/// Recognise the buffer layouts decoders actually emit.
+///
+/// Some decoders do not honour the negotiated type: the Microsoft HEVC
+/// decoder decodes 4:4:4 (RExt) streams, advertises NV12, but fills the
+/// buffer with 32-bpp BGRX. The Video Processor MFT then reads BGRX as if it
+/// were NV12 and every frame comes out garbled, so such sources are read
+/// natively and the layout is sniffed from the buffer size instead:
+/// `w*h*4` is BGRX, `w*h*3/2` is NV12, plus stride-padded variants of both.
+/// P010 (`w*h*3`) and anything unrecognised return `None` so the caller can
+/// fall back to the Video Processor path.
+fn detect_layout(len: usize, w: usize, h: usize) -> Option<DecodedLayout> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if len == w * h * 4 {
+        return Some(DecodedLayout::Bgra { stride: w * 4 });
+    }
+    if len * 2 == w * h * 3 {
+        return Some(DecodedLayout::Nv12 { stride: w });
+    }
+    if len % h == 0 {
+        let stride = len / h;
+        if stride >= w * 4 && stride < w * 4 + 4096 && stride % 4 == 0 {
+            return Some(DecodedLayout::Bgra { stride });
+        }
+    }
+    if (len * 2) % (h * 3) == 0 {
+        let stride = len * 2 / (h * 3);
+        // A stride of 2*w would mean 16-bit samples (P010), not NV12.
+        if stride >= w && stride < w * 2 && stride % 2 == 0 {
+            return Some(DecodedLayout::Nv12 { stride });
+        }
+    }
+    None
+}
+
+struct SourceSetup {
+    reader: *mut c_void,
+    src_w: u32,
+    src_h: u32,
+    fps_num: u32,
+    fps_den: u32,
+    source_bitrate: Option<u32>,
+    has_audio: bool,
+    layout: DecodedLayout,
+    matrix: rgb::YuvMatrix,
+    full_range: bool,
+    /// First decoded video sample, when the strategy had to read one to sniff
+    /// the layout.
+    first_video: Option<(*mut c_void, i64)>,
+}
+
+unsafe fn set_current_media_type(
+    reader: *mut c_void,
+    stream: u32,
+    media_type: *mut c_void,
+) -> HRESULT {
+    com_call!(
+        reader,
+        7,
+        unsafe extern "system" fn(*mut c_void, u32, *mut u32, *mut c_void) -> HRESULT,
+        stream,
+        std::ptr::null_mut::<u32>(),
+        media_type
+    )
+}
+
+unsafe fn set_stream_selection(reader: *mut c_void, stream: u32) {
+    com_call!(
+        reader,
+        4,
+        unsafe extern "system" fn(*mut c_void, u32, i32) -> HRESULT,
+        stream,
+        1i32
+    );
+}
+
+/// Byte length of the sample's contiguous buffer.
+unsafe fn sample_contiguous_len(sample: *mut c_void) -> Result<u32, Error> {
+    let mut buffer: *mut c_void = std::ptr::null_mut();
+    let hr = com_call!(
+        sample,
+        41,
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        &mut buffer
+    );
+    if !hres_ok(hr) || buffer.is_null() {
+        if !buffer.is_null() {
+            release_com(buffer);
+        }
+        return Err(err_decode("ConvertToContiguousBuffer", hr));
+    }
+
+    let mut data: *mut u8 = std::ptr::null_mut();
+    let mut max_len: u32 = 0;
+    let mut cur_len: u32 = 0;
+    let hr = com_call!(
+        buffer,
+        3,
+        unsafe extern "system" fn(*mut c_void, *mut *mut u8, *mut u32, *mut u32) -> HRESULT,
+        &mut data,
+        &mut max_len,
+        &mut cur_len
+    );
+    com_call!(buffer, 4, unsafe extern "system" fn(*mut c_void) -> HRESULT);
+    release_com(buffer);
+    let _ = max_len;
+    if !hres_ok(hr) || data.is_null() {
+        return Err(err_decode("IMFMediaBuffer::Lock", hr));
+    }
+    Ok(cur_len)
+}
+
+unsafe fn open_source(in_url: &[u16], strategy: DecodeStrategy) -> Result<SourceSetup, Error> {
+    let attrs = match strategy {
+        DecodeStrategy::Native => std::ptr::null_mut(),
+        DecodeStrategy::VideoProcessor => source_reader_attributes()?,
+    };
+    let mut reader: *mut c_void = std::ptr::null_mut();
+    let hr = MFCreateSourceReaderFromURL(in_url.as_ptr(), attrs, &mut reader);
+    release_com(attrs);
+    if !hres_ok(hr) || reader.is_null() {
+        return Err(err_decode("MFCreateSourceReaderFromURL", hr));
+    }
+
+    match configure_source(reader, strategy) {
+        Ok(setup) => Ok(setup),
+        Err(e) => {
+            release_com(reader);
+            Err(e)
+        }
+    }
+}
+
+unsafe fn configure_source(
+    reader: *mut c_void,
+    strategy: DecodeStrategy,
+) -> Result<SourceSetup, Error> {
+    // Native (compressed) video type: size, frame rate, bitrate, colour space.
+    let mut native: *mut c_void = std::ptr::null_mut();
+    let hr = com_call!(
+        reader,
+        5,
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
+        MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+        0u32,
+        &mut native
+    );
+    if !hres_ok(hr) || native.is_null() {
+        return Err(err_decode("GetNativeMediaType (video)", hr));
+    }
+    let size = attr_get_size(native, &MF_MT_FRAME_SIZE);
+    let (fps_num, fps_den) = match attr_get_ratio(native, &MF_MT_FRAME_RATE) {
+        Ok((n, d)) if n > 0 && d > 0 => (n, d),
+        _ => (DEFAULT_FRAME_RATE, 1),
+    };
+    let source_bitrate = attr_get_u32(native, &MF_MT_AVG_BITRATE)
+        .ok()
+        .filter(|value| *value > 0);
+    let yuv_matrix = attr_get_u32(native, &MF_MT_YUV_MATRIX).ok();
+    let full_range =
+        attr_get_u32(native, &MF_MT_VIDEO_NOMINAL_RANGE).ok() == Some(MF_NOMINAL_RANGE_0_255);
+    release_com(native);
+
+    let (src_w, src_h) = size.map_err(|hr| err_decode("GetUINT64 (MF_MT_FRAME_SIZE)", hr))?;
+    if src_w == 0 || src_h == 0 {
+        return Err(err_decode("video stream has zero dimensions", -1));
+    }
+
+    let mut audio_native: *mut c_void = std::ptr::null_mut();
+    let audio_hr = com_call!(
+        reader,
+        5,
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
+        MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+        0u32,
+        &mut audio_native
+    );
+    let has_audio = hres_ok(audio_hr) && !audio_native.is_null();
+    if has_audio {
+        release_com(audio_native);
+    }
+
+    // Select the first video / audio stream only.
+    set_stream_selection(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+    if has_audio {
+        set_stream_selection(reader, MF_SOURCE_READER_FIRST_AUDIO_STREAM);
+    }
+
+    let matrix = match yuv_matrix {
+        Some(MF_VIDEO_TRANSFER_MATRIX_BT601) => rgb::YuvMatrix::Bt601,
+        Some(MF_VIDEO_TRANSFER_MATRIX_BT709) => rgb::YuvMatrix::Bt709,
+        // Same heuristic Media Foundation uses: HD and above is BT.709.
+        _ if src_h >= 720 => rgb::YuvMatrix::Bt709,
+        _ => rgb::YuvMatrix::Bt601,
+    };
+
+    let (video_type, context) = match strategy {
+        DecodeStrategy::Native => (
+            source_nv12_type(src_w, src_h)?,
+            "SetCurrentMediaType (NV12)",
+        ),
+        DecodeStrategy::VideoProcessor => (
+            source_rgb32_type(src_w, src_h)?,
+            "SetCurrentMediaType (RGB32)",
+        ),
+    };
+    let hr = set_current_media_type(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, video_type);
+    release_com(video_type);
+    if !hres_ok(hr) {
+        return Err(err_decode(context, hr));
+    }
+
+    if has_audio {
+        let audio_type = source_pcm_type()?;
+        let hr = set_current_media_type(reader, MF_SOURCE_READER_FIRST_AUDIO_STREAM, audio_type);
+        release_com(audio_type);
+        if !hres_ok(hr) {
+            return Err(err_decode("SetCurrentMediaType (PCM)", hr));
+        }
+    }
+
+    let (layout, first_video) = match strategy {
+        DecodeStrategy::Native => {
+            let Some((sample, ts)) = read_sample(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM)?
+            else {
+                return Err(err_decode("video stream has no samples", -1));
+            };
+            let len = match sample_contiguous_len(sample) {
+                Ok(len) => len,
+                Err(e) => {
+                    release_com(sample);
+                    return Err(e);
+                }
+            };
+            match detect_layout(len as usize, src_w as usize, src_h as usize) {
+                Some(layout) => (layout, Some((sample, ts))),
+                None => {
+                    release_com(sample);
+                    return Err(err_decode("unexpected decoder buffer layout", -1));
+                }
+            }
+        }
+        DecodeStrategy::VideoProcessor => (
+            DecodedLayout::Bgra {
+                stride: src_w as usize * 4,
+            },
+            None,
+        ),
+    };
+
+    Ok(SourceSetup {
+        reader,
+        src_w,
+        src_h,
+        fps_num,
+        fps_den,
+        source_bitrate,
+        has_audio,
+        layout,
+        matrix,
+        full_range,
+        first_video,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -835,130 +1183,35 @@ fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Result<(), 
 
 unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) -> Result<(), Error> {
     // ── Source reader ────────────────────────────────────────────────────
-    // The reader needs video processing enabled up front: RGB32 output is only
-    // reachable through the Video Processor MFT.
-    let reader_attrs = source_reader_attributes()?;
-    let mut reader: *mut c_void = std::ptr::null_mut();
-    let hr = MFCreateSourceReaderFromURL(in_url.as_ptr(), reader_attrs, &mut reader);
-    release_com(reader_attrs);
-    if !hres_ok(hr) || reader.is_null() {
-        return Err(err_decode("MFCreateSourceReaderFromURL", hr));
-    }
-
-    // Probe the first video stream and read native dimensions / frame rate.
-    let mut native: *mut c_void = std::ptr::null_mut();
-    let hr = com_call!(
+    // Read the decoder's native output first and convert on the CPU. Some
+    // decoders advertise NV12 but emit 32-bpp BGRX for 4:4:4 (RExt) streams;
+    // the Video Processor would misinterpret those buffers and garble every
+    // frame. Sources the native path cannot serve (P010 and other 10-bit
+    // formats) fall back to the processor, which converts them to RGB32.
+    let setup = match open_source(in_url, DecodeStrategy::Native) {
+        Ok(setup) => setup,
+        Err(_) => open_source(in_url, DecodeStrategy::VideoProcessor)?,
+    };
+    let SourceSetup {
         reader,
-        5,
-        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-        0u32,
-        &mut native
-    );
-    if !hres_ok(hr) || native.is_null() {
-        release_com(reader);
-        return Err(err_decode("GetNativeMediaType (video)", hr));
-    }
-
-    let (src_w, src_h) = match attr_get_size(native, &MF_MT_FRAME_SIZE) {
-        Ok(v) => v,
-        Err(_) => {
-            release_com(native);
-            release_com(reader);
-            return Err(err_decode("MFGetAttributeSize", -1));
-        }
-    };
-
-    let (fps_num, fps_den) = match attr_get_ratio(native, &MF_MT_FRAME_RATE) {
-        Ok((n, d)) if n > 0 && d > 0 => (n, d),
-        _ => (DEFAULT_FRAME_RATE, 1),
-    };
-    let source_bitrate = attr_get_u32(native, &MF_MT_AVG_BITRATE)
-        .ok()
-        .filter(|value| *value > 0);
-    release_com(native);
-
-    if src_w == 0 || src_h == 0 {
-        release_com(reader);
-        return Err(err_decode("video stream has zero dimensions", -1));
-    }
+        src_w,
+        src_h,
+        fps_num,
+        fps_den,
+        source_bitrate,
+        has_audio,
+        layout,
+        matrix,
+        full_range,
+        first_video,
+    } = setup;
 
     let (target_w, target_h) =
         compute_video_target_dimensions(src_w, src_h, target.max_width, target.max_height);
     let fps = (fps_num as u64 + fps_den as u64 - 1) / fps_den as u64; // ceil
     let fps = fps.clamp(1, u32::MAX as u64) as u32;
-    let bitrate_bps = target.resolve_bitrate_bps(
-        source_bitrate,
-        (src_w, src_h),
-        (target_w, target_h),
-        fps,
-    );
-
-    // Probe for audio.
-    let mut audio_native: *mut c_void = std::ptr::null_mut();
-    let audio_hr = com_call!(
-        reader,
-        5,
-        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
-        MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-        0u32,
-        &mut audio_native
-    );
-    let has_audio = hres_ok(audio_hr) && !audio_native.is_null();
-    if has_audio {
-        release_com(audio_native);
-    }
-
-    // Select first video / audio stream only.
-    com_call!(
-        reader,
-        4,
-        unsafe extern "system" fn(*mut c_void, u32, i32) -> HRESULT,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-        1i32
-    );
-    if has_audio {
-        com_call!(
-            reader,
-            4,
-            unsafe extern "system" fn(*mut c_void, u32, i32) -> HRESULT,
-            MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-            1i32
-        );
-    }
-
-    // ── Configure source output formats ──────────────────────────────────
-    let video_src_type = source_rgb32_type(src_w, src_h)?;
-    let hr = com_call!(
-        reader,
-        7,
-        unsafe extern "system" fn(*mut c_void, u32, *mut u32, *mut c_void) -> HRESULT,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-        std::ptr::null_mut::<u32>(),
-        video_src_type
-    );
-    release_com(video_src_type);
-    if !hres_ok(hr) {
-        release_com(reader);
-        return Err(err_decode("SetCurrentMediaType (RGB32)", hr));
-    }
-
-    if has_audio {
-        let audio_src_type = source_pcm_type()?;
-        let hr = com_call!(
-            reader,
-            7,
-            unsafe extern "system" fn(*mut c_void, u32, *mut u32, *mut c_void) -> HRESULT,
-            MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-            std::ptr::null_mut::<u32>(),
-            audio_src_type
-        );
-        release_com(audio_src_type);
-        if !hres_ok(hr) {
-            release_com(reader);
-            return Err(err_decode("SetCurrentMediaType (PCM)", hr));
-        }
-    }
+    let bitrate_bps =
+        target.resolve_bitrate_bps(source_bitrate, (src_w, src_h), (target_w, target_h), fps);
 
     // ── Sink writer ──────────────────────────────────────────────────────
     let mut writer: *mut c_void = std::ptr::null_mut();
@@ -1047,7 +1300,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
     }
 
     // ── Pump samples (timestamp-interleaved) ─────────────────────────────
-    let mut video_pending: Option<(*mut c_void, i64)> = None;
+    let mut video_pending: Option<(*mut c_void, i64)> = first_video;
     let mut audio_pending: Option<(*mut c_void, i64)> = None;
     let mut video_done = false;
     let mut audio_done = !has_audio;
@@ -1090,6 +1343,9 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
                     target_w as usize,
                     target_h as usize,
                     fps as i64,
+                    layout,
+                    matrix,
+                    full_range,
                 );
                 release_com(sample);
                 r?;
@@ -1118,7 +1374,11 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
     }
 
     // ── Finalize ─────────────────────────────────────────────────────────
-    let hr = com_call!(writer, 11, unsafe extern "system" fn(*mut c_void) -> HRESULT);
+    let hr = com_call!(
+        writer,
+        11,
+        unsafe extern "system" fn(*mut c_void) -> HRESULT
+    );
     release_com(writer);
     release_com(reader);
     if !hres_ok(hr) {
@@ -1169,7 +1429,7 @@ unsafe fn read_sample(
     Ok(Some((sample, ts)))
 }
 
-/// Convert one decoded RGB32 frame to the target size and write it.
+/// Convert one decoded frame to packed BGRA at the target size and write it.
 unsafe fn write_video_sample(
     writer: *mut c_void,
     stream: u32,
@@ -1180,6 +1440,9 @@ unsafe fn write_video_sample(
     target_w: usize,
     target_h: usize,
     fps: i64,
+    layout: DecodedLayout,
+    matrix: rgb::YuvMatrix,
+    full_range: bool,
 ) -> Result<(), Error> {
     // IMFSample vtable slots (from the Windows SDK, mfobjects.h):
     // GetSampleTime=35, SetSampleTime=36, GetSampleDuration=37,
@@ -1244,25 +1507,46 @@ unsafe fn write_video_sample(
     }
     let _ = max_len;
 
-    let frame_len = src_w * src_h * 4;
-    let src_slice = std::slice::from_raw_parts(data, cur_len.min(frame_len as u32) as usize);
-
-    let scaled = if target_w != src_w || target_h != src_h {
-        rgb::scale_bgra(src_slice, src_w, src_h, target_w, target_h)
-    } else {
-        src_slice.to_vec()
+    // Copy out while the source buffer is still locked: Media Foundation may
+    // hand the same memory to the output buffer created below.
+    let src_slice = std::slice::from_raw_parts(data, cur_len as usize);
+    let bgra: Vec<u8> = match layout {
+        DecodedLayout::Bgra { stride } if stride == src_w * 4 => {
+            let len = (src_w * src_h * 4).min(src_slice.len());
+            src_slice[..len].to_vec()
+        }
+        DecodedLayout::Bgra { stride } => rgb::pack_bgra_rows(src_slice, src_w, src_h, stride),
+        DecodedLayout::Nv12 { stride } => {
+            rgb::nv12_to_bgra(src_slice, src_w, src_h, stride, matrix, full_range)
+        }
     };
 
-    com_call!(contiguous, 4, unsafe extern "system" fn(*mut c_void) -> HRESULT);
+    com_call!(
+        contiguous,
+        4,
+        unsafe extern "system" fn(*mut c_void) -> HRESULT
+    );
     release_com(contiguous);
 
-    if scaled.is_empty() {
+    if bgra.is_empty() {
+        return Err(err_decode("frame conversion produced empty buffer", -1));
+    }
+
+    let scaled: Vec<u8>;
+    let frame: &[u8] = if target_w != src_w || target_h != src_h {
+        scaled = rgb::scale_bgra(&bgra, src_w, src_h, target_w, target_h);
+        &scaled
+    } else {
+        &bgra
+    };
+
+    if frame.is_empty() {
         return Err(err_decode("frame scale produced empty buffer", -1));
     }
 
     // Build a new sample backed by a contiguous memory buffer.
     let mut out_buffer: *mut c_void = std::ptr::null_mut();
-    let hr = MFCreateMemoryBuffer(scaled.len() as u32, &mut out_buffer);
+    let hr = MFCreateMemoryBuffer(frame.len() as u32, &mut out_buffer);
     if !hres_ok(hr) || out_buffer.is_null() {
         if !out_buffer.is_null() {
             release_com(out_buffer);
@@ -1286,13 +1570,17 @@ unsafe fn write_video_sample(
         return Err(err_encode("IMFMediaBuffer::Lock (out)", hr));
     }
     let _ = (out_max, out_cur);
-    std::ptr::copy_nonoverlapping(scaled.as_ptr(), out_data, scaled.len());
-    com_call!(out_buffer, 4, unsafe extern "system" fn(*mut c_void) -> HRESULT);
+    std::ptr::copy_nonoverlapping(frame.as_ptr(), out_data, frame.len());
+    com_call!(
+        out_buffer,
+        4,
+        unsafe extern "system" fn(*mut c_void) -> HRESULT
+    );
     com_call!(
         out_buffer,
         6,
         unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
-        scaled.len() as u32
+        frame.len() as u32
     );
 
     let mut out_sample: *mut c_void = std::ptr::null_mut();
@@ -1347,7 +1635,40 @@ unsafe fn write_video_sample(
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_ratio, pack_size, unpack_ratio, unpack_size};
+    use super::*;
+
+    #[test]
+    fn detects_packed_nv12_and_bgra_layouts() {
+        assert_eq!(
+            detect_layout(1280 * 720 * 3 / 2, 1280, 720),
+            Some(DecodedLayout::Nv12 { stride: 1280 })
+        );
+        assert_eq!(
+            detect_layout(1280 * 720 * 4, 1280, 720),
+            Some(DecodedLayout::Bgra { stride: 5120 })
+        );
+    }
+
+    #[test]
+    fn detects_stride_padded_layouts() {
+        // NV12 with 1280 pixels on a 1344-byte stride.
+        assert_eq!(
+            detect_layout(1344 * 720 * 3 / 2, 1280, 720),
+            Some(DecodedLayout::Nv12 { stride: 1344 })
+        );
+        // BGRA with a 5184-byte stride.
+        assert_eq!(
+            detect_layout(5184 * 720, 1280, 720),
+            Some(DecodedLayout::Bgra { stride: 5184 })
+        );
+    }
+
+    #[test]
+    fn rejects_p010_and_unknown_layouts() {
+        // P010 is 16-bit: `w * h * 3` bytes must not be read as NV12.
+        assert_eq!(detect_layout(1280 * 720 * 3, 1280, 720), None);
+        assert_eq!(detect_layout(1234, 1280, 720), None);
+    }
 
     /// Values observed from `MF_MT_FRAME_SIZE` on a 480x640 source: Media
     /// Foundation puts the width in the high dword.
