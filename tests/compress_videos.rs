@@ -71,9 +71,7 @@ fn compress_all_test_videos() {
         let original_size = data.len();
         eprintln!("  COMPRESS  {}  size: {} bytes", file_name, original_size);
 
-        let mut options = VideoCompressOptions::new(800);
-        options.max_width = Some(1280);
-        options.max_height = Some(720);
+        let options = VideoCompressOptions::new(28.0);
 
         let t0 = Instant::now();
         match compress_video(&data, options) {
@@ -138,21 +136,19 @@ fn compress_all_test_videos() {
 /// a valid, smaller MP4. This is the API used by hosts that must not load the
 /// whole video into memory.
 #[test]
-fn compress_video_file_downscales() {
-    let input_path = input_dir().join("sample.mp4");
+fn compress_video_file_crf() {
+    let input_path = input_dir().join("short_landscape_1080p.mp4");
     if !input_path.exists() {
-        eprintln!("sample.mp4 does not exist — skipping test");
+        eprintln!("short_landscape_1080p.mp4 does not exist — skipping test");
         return;
     }
 
     let output_dir = base_dir().join("out_videos");
     fs::create_dir_all(&output_dir).expect("failed to create out_videos/");
-    let output_path = output_dir.join("sample_file_api.mp4");
+    let output_path = output_dir.join("short_landscape_1080p_file_api.mp4");
     let _ = fs::remove_file(&output_path);
 
-    let mut options = VideoCompressOptions::new(800);
-    options.max_width = Some(640);
-    options.max_height = Some(360);
+    let options = VideoCompressOptions::new(30.0);
 
     let compressed = compress_video_file(&input_path, &output_path, options)
         .expect("file api compression failed");
@@ -176,17 +172,16 @@ fn compress_video_file_downscales() {
     );
 
     eprintln!(
-        "file api downscaled: {} -> {} bytes ({:.1}%)",
+        "file api crf: {} -> {} bytes ({:.1}%)",
         input_len,
         output.len(),
         output.len() as f64 / input_len as f64 * 100.0
     );
 }
 
-/// Downscale a source video to a smaller resolution cap and verify the output
-/// is a valid, smaller MP4.
+/// Compress a source video by CRF and verify the output is a valid MP4.
 #[test]
-fn compress_video_downscales() {
+fn compress_video_crf() {
     let input_path = input_dir().join("sample.mp4");
     if !input_path.exists() {
         eprintln!("sample.mp4 does not exist — skipping test");
@@ -195,24 +190,54 @@ fn compress_video_downscales() {
 
     let input = fs::read(&input_path).expect("failed to read sample.mp4");
 
-    let mut options = VideoCompressOptions::new(800);
-    options.max_width = Some(640);
-    options.max_height = Some(360);
-
-    let out = compress_video(&input, options).expect("downscale failed");
+    let out =
+        compress_video(&input, VideoCompressOptions::new(30.0)).expect("crf compression failed");
     assert!(is_mp4(&out), "expected MP4 output");
     assert!(!out.is_empty(), "output is empty");
-    assert!(out.len() < input.len(), "downscale should shrink the file");
+    assert!(
+        out.len() < input.len(),
+        "compression should shrink the file"
+    );
 
     let output_dir = base_dir().join("out_videos");
     fs::create_dir_all(&output_dir).expect("failed to create out_videos/");
-    fs::write(output_dir.join("sample_downscaled.mp4"), &out)
-        .expect("failed to write downscaled output");
+    fs::write(output_dir.join("sample_crf.mp4"), &out).expect("failed to write compressed output");
 
     eprintln!(
-        "downscaled: {} -> {} bytes ({:.1}% of original)",
+        "crf compressed: {} -> {} bytes ({:.1}% of original)",
         input.len(),
         out.len(),
         out.len() as f64 / input.len() as f64 * 100.0
+    );
+}
+
+/// A lower CRF must keep more data than a higher one.
+#[test]
+fn lower_crf_produces_larger_output() {
+    let input_path = input_dir().join("short_landscape_1080p.mp4");
+    if !input_path.exists() {
+        eprintln!("short_landscape_1080p.mp4 does not exist — skipping test");
+        return;
+    }
+
+    let input = fs::read(&input_path).expect("failed to read short_landscape_1080p.mp4");
+    let high_quality =
+        compress_video(&input, VideoCompressOptions::new(24.0)).expect("crf 24 compression failed");
+    let low_quality =
+        compress_video(&input, VideoCompressOptions::new(35.0)).expect("crf 35 compression failed");
+
+    assert!(is_mp4(&high_quality), "expected MP4 output for CRF 24");
+    assert!(is_mp4(&low_quality), "expected MP4 output for CRF 35");
+    assert!(
+        high_quality.len() > low_quality.len(),
+        "CRF 24 should keep more data than CRF 35 ({} vs {})",
+        high_quality.len(),
+        low_quality.len()
+    );
+
+    eprintln!(
+        "crf sizes: 24 -> {} bytes, 35 -> {} bytes",
+        high_quality.len(),
+        low_quality.len()
     );
 }

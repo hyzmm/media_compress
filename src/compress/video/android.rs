@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::yuv::{self, CropRect};
 use super::{
-    compliant_codec, compute_video_target_dimensions, H264Target, VideoCodec, VideoCompressOptions,
-    VideoConvertOptions, VideoConvertOutcome,
+    compliant_codec, compute_video_target_dimensions, crf_to_quality_100, H264Target, VideoCodec,
+    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome,
 };
 use crate::error::Error;
 
@@ -675,8 +675,13 @@ unsafe fn transcode_fd(
     configure_from_track(&video_decoder, extractor.0, video_track.index)?;
     start_codec(&video_decoder, "video decoder")?;
 
-    let (video_encoder, encoder_color_format) =
-        create_video_encoder(target_w, target_h, video_track.frame_rate, bitrate_bps)?;
+    let (video_encoder, encoder_color_format) = create_video_encoder(
+        target_w,
+        target_h,
+        video_track.frame_rate,
+        target.crf(),
+        bitrate_bps,
+    )?;
 
     let audio_decoder = match &audio_track {
         Some(track) => {
@@ -1113,13 +1118,36 @@ fn start_codec(codec: &Codec, what: &str) -> Result<(), Error> {
     Ok(())
 }
 
+#[link(name = "c")]
+extern "C" {
+    fn __system_property_get(name: *const c_char, value: *mut c_char) -> i32;
+}
+
+/// `ro.build.version.sdk`, or 0 when the property cannot be read.
+fn android_api_level() -> i32 {
+    let mut value = [0 as c_char; 32];
+    let len =
+        unsafe { __system_property_get(c"ro.build.version.sdk".as_ptr(), value.as_mut_ptr()) };
+    if len <= 0 {
+        return 0;
+    }
+    unsafe { CStr::from_ptr(value.as_ptr()) }
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
 fn create_video_encoder(
     target_w: usize,
     target_h: usize,
     frame_rate: i32,
+    crf: Option<f32>,
     bitrate_bps: u32,
 ) -> Result<(Codec, i32), Error> {
-    let bitrate = bitrate_bps.clamp(100_000, i32::MAX as u32) as i32;
+    let bitrate_bps = bitrate_bps.clamp(100_000, i32::MAX as u32);
+    // MediaFormat.KEY_QUALITY only exists on API 28+; older releases keep VBR.
+    let cq_crf = crf.filter(|_| android_api_level() >= 28);
     let candidates: [Option<&CStr>; 3] = [
         None,
         Some(c"c2.android.avc.encoder"),
@@ -1129,58 +1157,115 @@ fn create_video_encoder(
 
     for candidate in candidates {
         for color_format in VIDEO_ENCODER_COLOR_FORMATS {
-            let ptr = unsafe {
-                match candidate {
-                    Some(name) => AMediaCodec_createCodecByName(name.as_ptr()),
-                    None => AMediaCodec_createEncoderByType(c"video/avc".as_ptr()),
+            if let Some(crf) = cq_crf {
+                match configure_video_encoder(
+                    candidate,
+                    color_format,
+                    target_w,
+                    target_h,
+                    frame_rate,
+                    Some(crf),
+                    bitrate_bps,
+                ) {
+                    Ok(codec) => return Ok((codec, color_format)),
+                    Err(cq_error) => match configure_video_encoder(
+                        candidate,
+                        color_format,
+                        target_w,
+                        target_h,
+                        frame_rate,
+                        None,
+                        bitrate_bps,
+                    ) {
+                        Ok(codec) => return Ok((codec, color_format)),
+                        Err(vbr_error) => {
+                            last_error = format!("CQ: {cq_error}; VBR: {vbr_error}");
+                            continue;
+                        }
+                    },
                 }
-            };
-            if ptr.is_null() {
-                last_error = format!("codec {candidate:?} unavailable");
-                continue;
-            }
-            let codec = Codec(ptr);
-
-            let Ok(fmt) = Format::new() else {
-                continue;
-            };
-            unsafe {
-                AMediaFormat_setString(fmt.0, c"mime".as_ptr(), c"video/avc".as_ptr());
-                AMediaFormat_setInt32(fmt.0, c"width".as_ptr(), target_w as i32);
-                AMediaFormat_setInt32(fmt.0, c"height".as_ptr(), target_h as i32);
-                AMediaFormat_setInt32(fmt.0, c"bitrate".as_ptr(), bitrate);
-                AMediaFormat_setInt32(fmt.0, c"frame-rate".as_ptr(), frame_rate);
-                AMediaFormat_setInt32(fmt.0, c"i-frame-interval".as_ptr(), 1);
-                AMediaFormat_setInt32(fmt.0, c"color-format".as_ptr(), color_format);
-            }
-            let ret = unsafe {
-                AMediaCodec_configure(
-                    codec.0,
-                    fmt.0,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    CONFIGURE_FLAG_ENCODE,
-                )
-            };
-            drop(fmt);
-            if ret != AMEDIA_OK {
-                last_error = format!("color-format {color_format} configure failed: {ret}");
-                continue;
             }
 
-            let start = unsafe { AMediaCodec_start(codec.0) };
-            if start != AMEDIA_OK {
-                last_error = format!("color-format {color_format} start failed: {start}");
-                continue;
+            match configure_video_encoder(
+                candidate,
+                color_format,
+                target_w,
+                target_h,
+                frame_rate,
+                None,
+                bitrate_bps,
+            ) {
+                Ok(codec) => return Ok((codec, color_format)),
+                Err(error) => last_error = error,
             }
-
-            return Ok((codec, color_format));
         }
     }
 
     Err(Error::EncodeError(format!(
         "no usable H.264 encoder ({last_error})"
     )))
+}
+
+fn configure_video_encoder(
+    candidate: Option<&CStr>,
+    color_format: i32,
+    target_w: usize,
+    target_h: usize,
+    frame_rate: i32,
+    crf: Option<f32>,
+    bitrate_bps: u32,
+) -> Result<Codec, String> {
+    let ptr = unsafe {
+        match candidate {
+            Some(name) => AMediaCodec_createCodecByName(name.as_ptr()),
+            None => AMediaCodec_createEncoderByType(c"video/avc".as_ptr()),
+        }
+    };
+    if ptr.is_null() {
+        return Err(format!("codec {candidate:?} unavailable"));
+    }
+    let codec = Codec(ptr);
+
+    let Ok(fmt) = Format::new() else {
+        return Err("AMediaFormat_new failed".into());
+    };
+    unsafe {
+        AMediaFormat_setString(fmt.0, c"mime".as_ptr(), c"video/avc".as_ptr());
+        AMediaFormat_setInt32(fmt.0, c"width".as_ptr(), target_w as i32);
+        AMediaFormat_setInt32(fmt.0, c"height".as_ptr(), target_h as i32);
+        AMediaFormat_setInt32(fmt.0, c"bitrate".as_ptr(), bitrate_bps as i32);
+        AMediaFormat_setInt32(fmt.0, c"frame-rate".as_ptr(), frame_rate);
+        AMediaFormat_setInt32(fmt.0, c"i-frame-interval".as_ptr(), 1);
+        AMediaFormat_setInt32(fmt.0, c"color-format".as_ptr(), color_format);
+        if let Some(crf) = crf {
+            // BITRATE_MODE_CQ = 0 (MediaCodecInfo.EncoderCapabilities).
+            AMediaFormat_setInt32(fmt.0, c"bitrate-mode".as_ptr(), 0);
+            // MediaFormat.KEY_QUALITY (API 28+), 0..=100, higher is better.
+            AMediaFormat_setInt32(fmt.0, c"quality".as_ptr(), crf_to_quality_100(crf));
+        }
+    }
+    let ret = unsafe {
+        AMediaCodec_configure(
+            codec.0,
+            fmt.0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CONFIGURE_FLAG_ENCODE,
+        )
+    };
+    drop(fmt);
+    if ret != AMEDIA_OK {
+        return Err(format!(
+            "color-format {color_format} configure failed: {ret}"
+        ));
+    }
+
+    let start = unsafe { AMediaCodec_start(codec.0) };
+    if start != AMEDIA_OK {
+        return Err(format!("color-format {color_format} start failed: {start}"));
+    }
+
+    Ok(codec)
 }
 
 fn create_audio_encoder(sample_rate: i32, channels: i32) -> Result<Codec, Error> {

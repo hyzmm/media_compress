@@ -5,7 +5,7 @@ use std::ffi::{c_char, CString};
 use std::path::Path;
 
 use jni::objects::{JObject, JString};
-use jni::sys::jint;
+use jni::sys::{jfloat, jint};
 use jni::JNIEnv;
 
 use crate::{compress_video_file, VideoCompressOptions};
@@ -41,7 +41,7 @@ pub extern "system" fn Java_com_hyzmm_mediacompress_testapp_NativeBridge_compres
     _this: JObject,
     input: JString,
     output: JString,
-    bitrate_kbps: jint,
+    crf: jfloat,
     max_width: jint,
     max_height: jint,
 ) -> jint {
@@ -52,13 +52,13 @@ pub extern "system" fn Java_com_hyzmm_mediacompress_testapp_NativeBridge_compres
     };
 
     let options = VideoCompressOptions {
-        bitrate_kbps: bitrate_kbps.max(1) as u32,
+        crf,
         max_width: (max_width > 0).then_some(max_width as u32),
         max_height: (max_height > 0).then_some(max_height as u32),
     };
 
     log(&format!(
-        "compressVideoFile: {input} -> {output} bitrate {bitrate_kbps} max {max_width}x{max_height}"
+        "compressVideoFile: {input} -> {output} crf {crf} max {max_width}x{max_height}"
     ));
 
     match compress_video_file(Path::new(&input), Path::new(&output), options) {

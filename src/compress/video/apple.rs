@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::transform::{display_size_u32, layer_transform, CGAffineTransform};
 use super::{
-    compliant_codec, compute_video_target_dimensions, H264Target, VideoCodec, VideoCompressOptions,
-    VideoConvertOptions, VideoConvertOutcome, VideoFormat,
+    compliant_codec, compute_video_target_dimensions, crf_to_quality_unit, H264Target, VideoCodec,
+    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome, VideoFormat,
 };
 use crate::error::Error;
 
@@ -66,6 +66,7 @@ struct CFDictionaryKeyCallBacks {
 // ---------------------------------------------------------------------------
 
 const CF_NUMBER_SINT32_TYPE: i32 = 3;
+const CF_NUMBER_FLOAT32_TYPE: i32 = 5;
 const K_CMTIME_FLAGS_VALID: u32 = 1;
 const K_AUDIO_FORMAT_MPEG4_AAC: i32 = 0x6161_6320; // "aac "
 const K_AUDIO_FORMAT_LINEAR_PCM: i32 = 0x6c70_636d; // "lpcm"
@@ -226,6 +227,11 @@ extern "C" {
     static AVVideoCodecTypeH264: CFStringRef;
 }
 
+#[link(name = "VideoToolbox", kind = "framework")]
+extern "C" {
+    static kVTCompressionPropertyKey_Quality: CFStringRef;
+}
+
 // ---------------------------------------------------------------------------
 // FFI — CoreMedia
 // ---------------------------------------------------------------------------
@@ -309,6 +315,14 @@ unsafe fn cf_number_i32(v: i32) -> CFNumberRef {
         std::ptr::null(),
         CF_NUMBER_SINT32_TYPE,
         &v as *const i32 as *const c_void,
+    )
+}
+
+unsafe fn cf_number_f32(v: f32) -> CFNumberRef {
+    CFNumberCreate(
+        std::ptr::null(),
+        CF_NUMBER_FLOAT32_TYPE,
+        &v as *const f32 as *const c_void,
     )
 }
 
@@ -688,22 +702,40 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
             return Err(Error::EncodeError("AVAssetWriter creation failed".into()));
         }
 
-        let estimated = msg_float(video_track, sel(c"estimatedDataRate"));
-        let source_bitrate_bps =
-            (estimated.is_finite() && estimated >= 1.0).then(|| estimated as u32);
-        let bitrate_bps = target.resolve_bitrate_bps(
-            source_bitrate_bps,
-            (display_w, display_h),
-            (target_w, target_h),
-            timescale as u32,
-        );
         let w_num = cf_number_i32(target_w as i32);
         let h_num = cf_number_i32(target_h as i32);
-        let bitrate_num = cf_number_i32(bitrate_bps.min(i32::MAX as u32) as i32);
-        let compression = cf_dictionary(
-            &[AVVideoAverageBitRateKey, AVVideoProfileLevelKey],
-            &[bitrate_num, AVVideoProfileLevelH264MainAutoLevel],
-        );
+        let compression = if let Some(crf) = target.crf() {
+            let quality_num = cf_number_f32(crf_to_quality_unit(crf));
+            let properties = cf_dictionary(
+                &[
+                    kVTCompressionPropertyKey_Quality as *const c_void,
+                    AVVideoProfileLevelKey,
+                ],
+                &[
+                    quality_num as *const c_void,
+                    AVVideoProfileLevelH264MainAutoLevel,
+                ],
+            );
+            CFRelease(quality_num);
+            properties
+        } else {
+            let estimated = msg_float(video_track, sel(c"estimatedDataRate"));
+            let source_bitrate_bps =
+                (estimated.is_finite() && estimated >= 1.0).then(|| estimated as u32);
+            let bitrate_bps = target.resolve_bitrate_bps(
+                source_bitrate_bps,
+                (display_w, display_h),
+                (target_w, target_h),
+                timescale as u32,
+            );
+            let bitrate_num = cf_number_i32(bitrate_bps.min(i32::MAX as u32) as i32);
+            let properties = cf_dictionary(
+                &[AVVideoAverageBitRateKey, AVVideoProfileLevelKey],
+                &[bitrate_num, AVVideoProfileLevelH264MainAutoLevel],
+            );
+            CFRelease(bitrate_num);
+            properties
+        };
         let video_settings = cf_dictionary(
             &[
                 AVVideoCodecKey,
@@ -714,7 +746,6 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
             &[AVVideoCodecTypeH264, w_num, h_num, compression],
         );
         CFRelease(compression);
-        CFRelease(bitrate_num);
 
         let video_input = msg_id2(
             class(c"AVAssetWriterInput"),

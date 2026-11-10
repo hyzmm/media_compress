@@ -155,20 +155,19 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 - Android：通过 NDK 原生 MediaCodec + MediaMuxer（libmediandk）转码，无需调用方注入 `JavaVM`。
 - Windows：通过 Media Foundation（IMFSourceReader / IMFSinkWriter）转码，视频解码为 RGB32、缩放后编码为 H.264，音频重编码为 AAC。
 
-统一输出 H.264 + MP4，音频重编码为 AAC。压缩参数为目标码率 + 分辨率上限，只缩小不放大、保持宽高比；若压缩后更大则返回原始字节。
+统一输出 H.264 + MP4，音频重编码为 AAC。视频按 x264 风格 CRF 压缩（0–51，越小画质越高、体积越大）；`max_width`/`max_height` 字段保留但当前不生效，输出保持源视频宽高。若压缩后更大则返回原始字节。
 
 ```rust
 use media_compress::{compress_video, VideoCompressOptions};
 
 let input = std::fs::read("input.mp4")?;
-let mut options = VideoCompressOptions::new(2000); // 目标码率 2000 kbps
-options.max_width = Some(1280);
-options.max_height = Some(720);
+let options = VideoCompressOptions::new(28.0); // CRF 28
 let out = compress_video(&input, options)?;
 std::fs::write("out.mp4", out)?;
 ```
 
 - 支持的源容器：MP4 / MOV（QuickTime）等平台可解码格式。
+- CRF 的平台落点：macOS / iOS 使用 VideoToolbox 的 Quality（0–1）属性；Android API 28+ 使用 MediaCodec CQ + quality，老版本回退到 CRF 等价码率；Windows 的 MF sink writer 只暴露平均码率，因此按 CRF 换算目标码率（VBR）。
 - macOS / iOS 会把视频轨的 `preferredTransform` 应用到输出，Android 读取 `rotation-degrees` 并把帧物理旋转为正向，竖屏/旋转视频都保持正确方向；Windows 暂未处理旋转元数据。
 - 文件路径版 API `compress_video_file(input, output, options)` 直接读写文件，不把视频载入内存；产物不更小时会删除产物并返回 `false`，调用方沿用原文件。
 

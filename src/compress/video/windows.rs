@@ -1210,6 +1210,8 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
         compute_video_target_dimensions(src_w, src_h, target.max_width, target.max_height);
     let fps = (fps_num as u64 + fps_den as u64 - 1) / fps_den as u64; // ceil
     let fps = fps.clamp(1, u32::MAX as u64) as u32;
+    // Media Foundation's sink writer only exposes average-bitrate control, so
+    // CRF targets are converted to an equivalent VBR bitrate here.
     let bitrate_bps =
         target.resolve_bitrate_bps(source_bitrate, (src_w, src_h), (target_w, target_h), fps);
 
