@@ -9,10 +9,13 @@ pub enum YuvMatrix {
     Bt709,
 }
 
-/// Convert an NV12 frame (full-size Y plane, then interleaved UV at half
-/// height) to tightly-packed BGRA32.
+/// Convert the visible part of an NV12 frame (full-size Y plane, then
+/// interleaved UV at half height) to tightly-packed BGRA32.
 ///
 /// `stride` is the byte stride of both planes and may exceed the width.
+/// `plane_height` is the height of the coded Y plane; it can exceed the
+/// visible `h` when the container crop hides padding rows, and the UV plane
+/// starts after all coded luma rows.
 /// `full_range` selects 0-255 input levels instead of the 16-235 video range.
 /// Returns an empty buffer when the input is too small.
 pub fn nv12_to_bgra(
@@ -20,13 +23,14 @@ pub fn nv12_to_bgra(
     w: usize,
     h: usize,
     stride: usize,
+    plane_height: usize,
     matrix: YuvMatrix,
     full_range: bool,
 ) -> Vec<u8> {
-    if w == 0 || h == 0 || stride < w {
+    if w == 0 || h == 0 || stride < w || plane_height < h {
         return Vec::new();
     }
-    let y_len = stride * h;
+    let y_len = stride * plane_height;
     let uv_rows = h.div_ceil(2);
     if src.len() < y_len + stride * uv_rows {
         return Vec::new();
@@ -166,11 +170,11 @@ mod tests {
     fn nv12_limited_range_extremes_map_to_black_and_white() {
         // 2x2 NV12: Y = 16 (black level), neutral chroma.
         let src = [16u8, 16, 16, 16, 128, 128];
-        let out = nv12_to_bgra(&src, 2, 2, 2, YuvMatrix::Bt709, false);
+        let out = nv12_to_bgra(&src, 2, 2, 2, 2, YuvMatrix::Bt709, false);
         assert_eq!(out, [0, 0, 0, 255].repeat(4));
 
         let src = [235u8, 235, 235, 235, 128, 128];
-        let out = nv12_to_bgra(&src, 2, 2, 2, YuvMatrix::Bt709, false);
+        let out = nv12_to_bgra(&src, 2, 2, 2, 2, YuvMatrix::Bt709, false);
         assert_eq!(out, [255, 255, 255, 255].repeat(4));
     }
 
@@ -178,7 +182,7 @@ mod tests {
     fn nv12_bt709_red_is_recovered() {
         // Limited-range BT.709 red: Y=63, Cb=102, Cr=240.
         let src = [63u8, 63, 63, 63, 102, 240];
-        let out = nv12_to_bgra(&src, 2, 2, 2, YuvMatrix::Bt709, false);
+        let out = nv12_to_bgra(&src, 2, 2, 2, 2, YuvMatrix::Bt709, false);
         assert_eq!(&out[..4], &[0, 1, 255, 255]);
     }
 
@@ -191,7 +195,7 @@ mod tests {
             100, 100, 0xAA, 0xAA, // Y row 1
             128, 128, 0xAA, 0xAA, // UV row
         ];
-        let out = nv12_to_bgra(&src, 2, 2, 4, YuvMatrix::Bt601, false);
+        let out = nv12_to_bgra(&src, 2, 2, 4, 2, YuvMatrix::Bt601, false);
         assert_eq!(out.len(), 16);
         // Y=100 with neutral chroma -> 1.164 * (100 - 16) = 97.8 -> 98.
         for px in out.as_chunks::<4>().0 {
@@ -200,9 +204,25 @@ mod tests {
     }
 
     #[test]
+    fn nv12_reads_chroma_after_the_coded_plane_height() {
+        // Visible 2x2 inside a coded 2x4 frame: the UV plane starts after the
+        // four coded luma rows, not after the two visible ones.
+        let src = [
+            235u8, 235, 235, 235, // visible Y rows 0-1 (white)
+            16, 16, 16, 16, // coded padding Y rows 2-3 (black)
+            128, 128, // UV row for the visible rows
+            128, 128, // UV row for the padding rows
+        ];
+        let out = nv12_to_bgra(&src, 2, 2, 2, 4, YuvMatrix::Bt709, false);
+        assert_eq!(out, [255, 255, 255, 255].repeat(4));
+    }
+
+    #[test]
     fn nv12_too_small_returns_empty() {
-        assert!(nv12_to_bgra(&[0u8; 5], 2, 2, 2, YuvMatrix::Bt709, false).is_empty());
-        assert!(nv12_to_bgra(&[0u8; 6], 2, 2, 1, YuvMatrix::Bt709, false).is_empty());
+        assert!(nv12_to_bgra(&[0u8; 5], 2, 2, 2, 2, YuvMatrix::Bt709, false).is_empty());
+        assert!(nv12_to_bgra(&[0u8; 6], 2, 2, 1, 2, YuvMatrix::Bt709, false).is_empty());
+        // Coded plane height below the visible height is rejected.
+        assert!(nv12_to_bgra(&[0u8; 16], 2, 2, 2, 1, YuvMatrix::Bt709, false).is_empty());
     }
 
     #[test]

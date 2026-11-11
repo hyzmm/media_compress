@@ -732,42 +732,73 @@ enum DecodedLayout {
     /// 32-bpp BGRX (the memory layout of `MFVideoFormat_RGB32`).
     Bgra { stride: usize },
     /// NV12: full-size Y plane, then interleaved UV at half height.
-    Nv12 { stride: usize },
+    ///
+    /// `plane_height` is the height of the coded Y plane, which can exceed the
+    /// visible frame height when the container crop hides padding rows. The UV
+    /// plane starts after all coded luma rows.
+    Nv12 { stride: usize, plane_height: usize },
 }
 
-/// Recognise the buffer layouts decoders actually emit.
+/// How many coded rows/columns beyond the visible frame the sniffing accepts.
+/// H.264 pads to 16-pixel macroblocks and HEVC to much larger CTBs, so the
+/// coded size can exceed the display size by dozens of rows.
+const MAX_CODED_PADDING: usize = 128;
+
+/// Recognise the buffer layouts decoders actually emit and the real geometry
+/// of the frame inside them.
 ///
-/// Some decoders do not honour the negotiated type: the Microsoft HEVC
-/// decoder decodes 4:4:4 (RExt) streams, advertises NV12, but fills the
-/// buffer with 32-bpp BGRX. The Video Processor MFT then reads BGRX as if it
-/// were NV12 and every frame comes out garbled, so such sources are read
-/// natively and the layout is sniffed from the buffer size instead:
-/// `w*h*4` is BGRX, `w*h*3/2` is NV12, plus stride-padded variants of both.
-/// P010 (`w*h*3`) and anything unrecognised return `None` so the caller can
-/// fall back to the Video Processor path.
+/// The buffer geometry cannot be taken from the media type: decoders and the
+/// Video Processor can hand back frames at the coded size (2048x1088 for a
+/// 2046x1080 H.264 stream, for example) while `MF_MT_FRAME_SIZE` and
+/// `MF_MT_DEFAULT_STRIDE` describe the visible size. Reading such a buffer
+/// with the visible stride shifts every row and shears the picture, so the
+/// real stride is derived from the buffer length instead: `len` must equal
+/// `stride * plane_height` for BGRX or `stride * plane_height * 3/2` for NV12.
+/// P010 (`3` bytes/pixel with a doubled stride) and anything unrecognised
+/// return `None` so the caller can fall back to the Video Processor path.
 fn detect_layout(len: usize, w: usize, h: usize) -> Option<DecodedLayout> {
     if w == 0 || h == 0 {
         return None;
     }
-    if len == w * h * 4 {
-        return Some(DecodedLayout::Bgra { stride: w * 4 });
-    }
-    if len * 2 == w * h * 3 {
-        return Some(DecodedLayout::Nv12 { stride: w });
-    }
-    if len % h == 0 {
-        let stride = len / h;
-        if stride >= w * 4 && stride < w * 4 + 4096 && stride % 4 == 0 {
-            return Some(DecodedLayout::Bgra { stride });
+
+    // Bytes per visible pixel separates the layouts before any stride math:
+    // BGRX is ~4, NV12 ~1.5, P010 ~3 (16-bit samples). The coded padding
+    // allowed by MAX_CODED_PADDING moves these by only a few percent.
+    let visible_pixels = w as u64 * h as u64;
+    let len64 = len as u64;
+    let might_be_bgra = len64 * 10 >= visible_pixels * 35 && len64 * 10 <= visible_pixels * 45;
+    let might_be_nv12 = len64 * 10 >= visible_pixels * 13 && len64 * 10 <= visible_pixels * 18;
+
+    let first_even = h + h % 2;
+    if might_be_bgra {
+        for plane_height in (first_even..=h + MAX_CODED_PADDING).step_by(2) {
+            if len % plane_height != 0 {
+                continue;
+            }
+            let stride = len / plane_height;
+            if stride >= w * 4 && stride < w * 4 + 4096 && stride % 4 == 0 {
+                return Some(DecodedLayout::Bgra { stride });
+            }
         }
     }
-    if (len * 2) % (h * 3) == 0 {
-        let stride = len * 2 / (h * 3);
-        // A stride of 2*w would mean 16-bit samples (P010), not NV12.
-        if stride >= w && stride < w * 2 && stride % 2 == 0 {
-            return Some(DecodedLayout::Nv12 { stride });
+
+    if might_be_nv12 {
+        for plane_height in (first_even..=h + MAX_CODED_PADDING).step_by(2) {
+            let doubled = len.checked_mul(2)?;
+            if doubled % (3 * plane_height) != 0 {
+                continue;
+            }
+            let stride = doubled / (3 * plane_height);
+            // A stride of 2*w would mean 16-bit samples (P010), not NV12.
+            if stride >= w && stride < w * 2 && stride % 2 == 0 {
+                return Some(DecodedLayout::Nv12 {
+                    stride,
+                    plane_height,
+                });
+            }
         }
     }
+
     None
 }
 
@@ -781,8 +812,8 @@ struct SourceSetup {
     layout: DecodedLayout,
     matrix: rgb::YuvMatrix,
     full_range: bool,
-    /// First decoded video sample, when the strategy had to read one to sniff
-    /// the layout.
+    /// First decoded video sample, read up front to sniff the real buffer
+    /// geometry.
     first_video: Option<(*mut c_void, i64)>,
 }
 
@@ -953,34 +984,33 @@ unsafe fn configure_source(
         }
     }
 
-    let (layout, first_video) = match strategy {
-        DecodeStrategy::Native => {
-            let Some((sample, ts)) = read_sample(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM)?
-            else {
-                return Err(err_decode("video stream has no samples", -1));
-            };
-            let len = match sample_contiguous_len(sample) {
-                Ok(len) => len,
-                Err(e) => {
-                    release_com(sample);
-                    return Err(e);
-                }
-            };
-            match detect_layout(len as usize, src_w as usize, src_h as usize) {
-                Some(layout) => (layout, Some((sample, ts))),
-                None => {
-                    release_com(sample);
-                    return Err(err_decode("unexpected decoder buffer layout", -1));
-                }
-            }
-        }
-        DecodeStrategy::VideoProcessor => (
-            DecodedLayout::Bgra {
-                stride: src_w as usize * 4,
-            },
-            None,
-        ),
+    // Both strategies sniff the first sample: decoders and the Video
+    // Processor may deliver coded-size buffers (visible size rounded up to
+    // macroblocks) even when the negotiated type reports the visible size.
+    let Some((sample, ts)) = read_sample(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM)? else {
+        return Err(err_decode("video stream has no samples", -1));
     };
+    let len = match sample_contiguous_len(sample) {
+        Ok(len) => len,
+        Err(e) => {
+            release_com(sample);
+            return Err(e);
+        }
+    };
+    let layout = match detect_layout(len as usize, src_w as usize, src_h as usize) {
+        Some(layout) => layout,
+        // The Video Processor is asked for packed RGB32 at the source size;
+        // if its buffer length fits no known geometry, assume exactly that
+        // rather than failing a source that used to transcode.
+        None if matches!(strategy, DecodeStrategy::VideoProcessor) => DecodedLayout::Bgra {
+            stride: src_w as usize * 4,
+        },
+        None => {
+            release_com(sample);
+            return Err(err_decode("unexpected decoder buffer layout", -1));
+        }
+    };
+    let first_video = Some((sample, ts));
 
     Ok(SourceSetup {
         reader,
@@ -1391,9 +1421,18 @@ unsafe fn write_video_sample(
             src_slice[..len].to_vec()
         }
         DecodedLayout::Bgra { stride } => rgb::pack_bgra_rows(src_slice, src_w, src_h, stride),
-        DecodedLayout::Nv12 { stride } => {
-            rgb::nv12_to_bgra(src_slice, src_w, src_h, stride, matrix, full_range)
-        }
+        DecodedLayout::Nv12 {
+            stride,
+            plane_height,
+        } => rgb::nv12_to_bgra(
+            src_slice,
+            src_w,
+            src_h,
+            stride,
+            plane_height,
+            matrix,
+            full_range,
+        ),
     };
 
     com_call!(
@@ -1516,7 +1555,10 @@ mod tests {
     fn detects_packed_nv12_and_bgra_layouts() {
         assert_eq!(
             detect_layout(1280 * 720 * 3 / 2, 1280, 720),
-            Some(DecodedLayout::Nv12 { stride: 1280 })
+            Some(DecodedLayout::Nv12 {
+                stride: 1280,
+                plane_height: 720
+            })
         );
         assert_eq!(
             detect_layout(1280 * 720 * 4, 1280, 720),
@@ -1529,12 +1571,41 @@ mod tests {
         // NV12 with 1280 pixels on a 1344-byte stride.
         assert_eq!(
             detect_layout(1344 * 720 * 3 / 2, 1280, 720),
-            Some(DecodedLayout::Nv12 { stride: 1344 })
+            Some(DecodedLayout::Nv12 {
+                stride: 1344,
+                plane_height: 720
+            })
         );
         // BGRA with a 5184-byte stride.
         assert_eq!(
             detect_layout(5184 * 720, 1280, 720),
             Some(DecodedLayout::Bgra { stride: 5184 })
+        );
+    }
+
+    #[test]
+    fn detects_frames_stored_at_the_coded_size() {
+        // A 2046x1080 H.264 stream is coded as 2048x1088. Decoders emit the
+        // coded size even though the media type reports 2046x1080; reading
+        // those buffers with the visible stride shears the picture.
+        assert_eq!(
+            detect_layout(2048 * 1088 * 3 / 2, 2046, 1080),
+            Some(DecodedLayout::Nv12 {
+                stride: 2048,
+                plane_height: 1088
+            })
+        );
+        assert_eq!(
+            detect_layout(2048 * 1088 * 4, 2046, 1080),
+            Some(DecodedLayout::Bgra { stride: 8192 })
+        );
+        // 1080p coded as 1088 rows is the same story at a common size.
+        assert_eq!(
+            detect_layout(1920 * 1088 * 3 / 2, 1920, 1080),
+            Some(DecodedLayout::Nv12 {
+                stride: 1920,
+                plane_height: 1088
+            })
         );
     }
 

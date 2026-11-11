@@ -153,7 +153,7 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 
 - macOS / iOS：通过 AVFoundation（AVAssetReader/AVAssetWriter）转码。
 - Android：通过 NDK 原生 MediaCodec + MediaMuxer（libmediandk）转码，无需调用方注入 `JavaVM`。
-- Windows：通过 Media Foundation（IMFSourceReader / IMFSinkWriter）转码，视频解码为 RGB32、缩放后编码为 H.264，音频重编码为 AAC。
+- Windows：通过 Media Foundation（IMFSourceReader / IMFSinkWriter）转码。优先读取解码器的原生 NV12 输出并在 CPU 转为 RGBA——按实际缓冲长度推导 stride 与 coded 高度（解码器可能输出比显示尺寸更大的缓冲，直接按显示 stride 读取会造成逐行错位），再裁切到显示尺寸；无法识别的格式回退到 Video Processor 的 RGB32。随后编码为 H.264，音频重编码为 AAC。
 
 统一输出 H.264 + MP4，音频重编码为 AAC。视频按 x264 风格 CRF 压缩（0–51，越小画质越高、体积越大）；`max_width`/`max_height` 字段保留但当前不生效，输出保持源视频宽高。即使转码结果比原文件大（例如高码率 HEVC 源转 H.264），也保留转码结果，不回退原文件。
 
