@@ -87,13 +87,6 @@ fn compress_all_test_videos() {
                     "expected MP4 output for {}",
                     file_name
                 );
-                assert!(
-                    output_bytes.len() <= original_size,
-                    "output should not be larger than input for {} (got {} vs {})",
-                    file_name,
-                    output_bytes.len(),
-                    original_size
-                );
 
                 let stem = path.file_stem().unwrap().to_string_lossy();
                 let out_path = output_dir.join(format!("{}.mp4", stem));
@@ -133,8 +126,8 @@ fn compress_all_test_videos() {
 }
 
 /// Compress a source video through the file-path API and verify the output is
-/// a valid, smaller MP4. This is the API used by hosts that must not load the
-/// whole video into memory.
+/// a valid MP4. This is the API used by hosts that must not load the whole
+/// video into memory.
 #[test]
 fn compress_video_file_crf() {
     let input_path = input_dir().join("short_landscape_1080p.mp4");
@@ -150,12 +143,7 @@ fn compress_video_file_crf() {
 
     let options = VideoCompressOptions::new(30.0);
 
-    let compressed = compress_video_file(&input_path, &output_path, options)
-        .expect("file api compression failed");
-    assert!(
-        compressed,
-        "expected the file api to produce a smaller file"
-    );
+    compress_video_file(&input_path, &output_path, options).expect("file api compression failed");
 
     let output = fs::read(&output_path).expect("failed to read file api output");
     assert!(is_mp4(&output), "expected MP4 output");
@@ -164,18 +152,51 @@ fn compress_video_file_crf() {
     let input_len = fs::metadata(&input_path)
         .expect("failed to stat input")
         .len() as usize;
-    assert!(
-        output.len() < input_len,
-        "file api output should be smaller than input ({} vs {})",
-        output.len(),
-        input_len
-    );
 
     eprintln!(
         "file api crf: {} -> {} bytes ({:.1}%)",
         input_len,
         output.len(),
         output.len() as f64 / input_len as f64 * 100.0
+    );
+}
+
+/// A re-encode that ends up larger than the source is still kept: the API
+/// targets H.264 output rather than a guaranteed size reduction.
+#[test]
+fn keeps_reencode_larger_than_source() {
+    let input_path = input_dir().join("convert_hevc.mp4");
+    if !input_path.exists() {
+        eprintln!("convert_hevc.mp4 does not exist — skipping test");
+        return;
+    }
+
+    let input = fs::read(&input_path).expect("failed to read convert_hevc.mp4");
+    let options = VideoCompressOptions::new(0.0);
+
+    let output = compress_video(&input, options).expect("crf 0 compression failed");
+    assert!(is_mp4(&output), "expected MP4 output");
+    assert!(
+        output.len() > input.len(),
+        "CRF 0 on an already-compressed source should be larger ({} vs {})",
+        output.len(),
+        input.len()
+    );
+
+    let output_dir = base_dir().join("out_videos");
+    fs::create_dir_all(&output_dir).expect("failed to create out_videos/");
+    let output_path = output_dir.join("convert_hevc_crf0_file_api.mp4");
+    let _ = fs::remove_file(&output_path);
+
+    compress_video_file(&input_path, &output_path, options).expect("file api compression failed");
+
+    let file_output = fs::read(&output_path).expect("failed to read file api output");
+    assert!(is_mp4(&file_output), "expected MP4 output");
+    assert!(
+        file_output.len() > input.len(),
+        "file api must keep a re-encode larger than the source ({} vs {})",
+        file_output.len(),
+        input.len()
     );
 }
 
@@ -194,10 +215,6 @@ fn compress_video_crf() {
         compress_video(&input, VideoCompressOptions::new(30.0)).expect("crf compression failed");
     assert!(is_mp4(&out), "expected MP4 output");
     assert!(!out.is_empty(), "output is empty");
-    assert!(
-        out.len() < input.len(),
-        "compression should shrink the file"
-    );
 
     let output_dir = base_dir().join("out_videos");
     fs::create_dir_all(&output_dir).expect("failed to create out_videos/");

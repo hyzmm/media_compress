@@ -330,14 +330,14 @@ pub(crate) fn compute_video_target_dimensions(
 /// The input and output files never go through memory: the platform backend
 /// reads and writes them itself.
 ///
-/// Returns `Ok(true)` when `output` contains a smaller re-encode. Returns
-/// `Ok(false)` when the re-encode was not smaller, in which case `output` has
-/// been removed and the caller should keep the original file.
+/// Returns `Ok(())` once `output` has been written. The re-encode is kept even
+/// when it ends up larger than `input` — the caller should use `output` as the
+/// result. `output` is only removed when encoding fails.
 pub fn compress_video_file(
     input: &Path,
     output: &Path,
     options: VideoCompressOptions,
-) -> Result<bool, Error> {
+) -> Result<(), Error> {
     #[cfg(not(any(
         target_os = "macos",
         target_os = "ios",
@@ -363,27 +363,9 @@ pub fn compress_video_file(
             Error::UnsupportedFormat("Cannot detect video format from magic bytes".into())
         })?;
 
-        let input_len = std::fs::metadata(input)
-            .map_err(|e| Error::DecodeError(format!("failed to stat input video: {e}")))?
-            .len();
-
-        match compress_video_file_platform(input, output, options) {
-            Ok(()) => {
-                let output_len = std::fs::metadata(output)
-                    .map_err(|e| Error::EncodeError(format!("failed to stat output video: {e}")))?
-                    .len();
-                if output_len >= input_len {
-                    let _ = std::fs::remove_file(output);
-                    Ok(false)
-                } else {
-                    Ok(true)
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(output);
-                Err(e)
-            }
-        }
+        compress_video_file_platform(input, output, options).inspect_err(|_| {
+            let _ = std::fs::remove_file(output);
+        })
     }
 }
 
@@ -476,6 +458,9 @@ fn read_header(path: &Path) -> Result<Vec<u8>, Error> {
 ///   `max_height` are reserved and not applied yet; output keeps the source
 ///   dimensions. Audio is re-encoded to AAC when present.
 ///
+/// The re-encode is returned even when it is larger than `input`; callers that
+/// need a size guarantee should decide after comparing lengths themselves.
+///
 /// # Platform support
 /// Implemented for macOS / iOS (AVFoundation), Android (MediaCodec) and
 /// Windows (Media Foundation). Other platforms return
@@ -485,12 +470,7 @@ pub fn compress_video(input: &[u8], options: VideoCompressOptions) -> Result<Vec
         Error::UnsupportedFormat("Cannot detect video format from magic bytes".into())
     })?;
 
-    let compressed = compress_video_platform(input, options)?;
-
-    if compressed.len() > input.len() {
-        return Ok(input.to_vec());
-    }
-    Ok(compressed)
+    compress_video_platform(input, options)
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]

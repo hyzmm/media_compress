@@ -32,8 +32,8 @@ fn jstring(env: &mut JNIEnv, value: &JString) -> Option<String> {
     env.get_string(value).ok().map(Into::into)
 }
 
-/// Returns 1 when a smaller re-encode was produced, 0 when the original was
-/// kept, and -1 on error.
+/// Returns 1 when the re-encode was written (even if larger than the source),
+/// and -1 on error.
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn Java_com_hyzmm_mediacompress_testapp_NativeBridge_compressVideoFile(
@@ -62,8 +62,7 @@ pub extern "system" fn Java_com_hyzmm_mediacompress_testapp_NativeBridge_compres
     ));
 
     match compress_video_file(Path::new(&input), Path::new(&output), options) {
-        Ok(true) => 1,
-        Ok(false) => 0,
+        Ok(()) => 1,
         Err(error) => {
             log(&format!("compressVideoFile failed: {error}"));
             -1
