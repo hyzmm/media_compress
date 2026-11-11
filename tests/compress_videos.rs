@@ -258,3 +258,18 @@ fn lower_crf_produces_larger_output() {
         low_quality.len()
     );
 }
+
+/// Unrecognised container bytes are rejected from magic-byte detection alone,
+/// before any platform backend runs.
+#[test]
+fn rejects_unrecognized_container() {
+    let err = compress_video(
+        b"this is not a video container",
+        VideoCompressOptions::new(28.0),
+    )
+    .expect_err("garbage bytes must not be treated as a video");
+    assert!(
+        matches!(err, media_compress::Error::UnsupportedFormat(_)),
+        "expected UnsupportedFormat, got {err:?}"
+    );
+}

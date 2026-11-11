@@ -5,8 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::yuv::{self, CropRect};
 use super::{
-    compliant_codec, compute_video_target_dimensions, crf_to_quality_100, H264Target, VideoCodec,
-    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome,
+    compute_video_target_dimensions, crf_to_quality_100, H264Target, VideoCompressOptions,
 };
 use crate::error::Error;
 
@@ -335,7 +334,6 @@ struct VideoTrack {
     rotation: u32,
     frame_rate: i32,
     max_input_size: usize,
-    bitrate: Option<u32>,
 }
 
 struct AudioTrack {
@@ -385,9 +383,6 @@ unsafe fn scan_tracks(
                 rotation: normalize_rotation(format_i32(fmt.0, c"rotation-degrees").unwrap_or(0)),
                 frame_rate,
                 max_input_size,
-                bitrate: format_i32(fmt.0, c"bitrate")
-                    .filter(|value| *value > 0)
-                    .map(|value| value as u32),
             });
         } else if audio.is_none() && mime.starts_with("audio/") {
             audio = Some(AudioTrack {
@@ -448,74 +443,6 @@ pub fn compress_file(
     options: VideoCompressOptions,
 ) -> Result<(), Error> {
     transcode(input, output, H264Target::compress(options))
-}
-
-/// Convert `input` to H.264/MP4 unless its video track is already H.264 within
-/// the size limits. HEVC is re-encoded like any other codec.
-pub fn convert_file(
-    input: &std::path::Path,
-    output: &std::path::Path,
-    options: VideoConvertOptions,
-) -> Result<VideoConvertOutcome, Error> {
-    let probe = probe_video(input)?;
-
-    if let Some(codec) = compliant_codec(probe.codec, probe.width, probe.height, options) {
-        return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
-    }
-
-    transcode(input, output, H264Target::convert(options))?;
-    Ok(VideoConvertOutcome::Converted)
-}
-
-/// Codec and display size of the first video track.
-struct VideoProbe {
-    codec: Option<VideoCodec>,
-    width: u32,
-    height: u32,
-}
-
-fn probe_video(path: &std::path::Path) -> Result<VideoProbe, Error> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::DecodeError(format!("failed to open input: {e}")))?;
-    let fd = file.as_raw_fd();
-    let len = std::fs::metadata(path)
-        .map_err(|e| Error::DecodeError(format!("failed to stat input: {e}")))?
-        .len() as i64;
-
-    let extractor = {
-        let ptr = unsafe { AMediaExtractor_new() };
-        if ptr.is_null() {
-            return Err(Error::DecodeError("AMediaExtractor_new failed".into()));
-        }
-        Extractor(ptr)
-    };
-    let ret = unsafe { AMediaExtractor_setDataSourceFd(extractor.0, fd, 0, len) };
-    if ret != AMEDIA_OK {
-        return Err(Error::DecodeError(format!(
-            "AMediaExtractor_setDataSourceFd failed: {ret}"
-        )));
-    }
-
-    let (video_track, _) = unsafe { scan_tracks(extractor.0)? };
-    let (width, height) = match video_track.rotation {
-        90 | 270 => (video_track.crop.height, video_track.crop.width),
-        _ => (video_track.crop.width, video_track.crop.height),
-    };
-
-    Ok(VideoProbe {
-        codec: video_codec(&video_track.mime),
-        width: width as u32,
-        height: height as u32,
-    })
-}
-
-/// Map a source track mime to the codecs the probe recognises.
-fn video_codec(mime: &str) -> Option<VideoCodec> {
-    match mime {
-        "video/avc" => Some(VideoCodec::H264),
-        "video/hevc" => Some(VideoCodec::Hevc),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -652,18 +579,13 @@ unsafe fn transcode_fd(
         90 | 270 => (video_track.crop.height, video_track.crop.width),
         _ => (video_track.crop.width, video_track.crop.height),
     };
-    let (target_w, target_h) = compute_video_target_dimensions(
-        display_w as u32,
-        display_h as u32,
-        target.max_width,
-        target.max_height,
-    );
+    let (target_w, target_h) = compute_video_target_dimensions(display_w as u32, display_h as u32);
     let (target_w, target_h) = (target_w as usize, target_h as usize);
-    let bitrate_bps = target.resolve_bitrate_bps(
-        video_track.bitrate,
-        (display_w as u32, display_h as u32),
-        (target_w as u32, target_h as u32),
+    let bitrate_bps = H264Target::crf_fallback_bitrate_bps(
+        target_w as u32,
+        target_h as u32,
         video_track.frame_rate as u32,
+        target.crf,
     );
 
     AMediaExtractor_selectTrack(extractor.0, video_track.index);
@@ -679,7 +601,7 @@ unsafe fn transcode_fd(
         target_w,
         target_h,
         video_track.frame_rate,
-        target.crf(),
+        Some(target.crf),
         bitrate_bps,
     )?;
 

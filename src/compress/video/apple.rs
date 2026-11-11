@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::transform::{display_size_u32, layer_transform, CGAffineTransform};
 use super::{
-    compliant_codec, compute_video_target_dimensions, crf_to_quality_unit, H264Target, VideoCodec,
-    VideoCompressOptions, VideoConvertOptions, VideoConvertOutcome, VideoFormat,
+    compute_video_target_dimensions, crf_to_quality_unit, H264Target, VideoCompressOptions,
+    VideoFormat,
 };
 use crate::error::Error;
 
@@ -77,12 +77,6 @@ const AUDIO_BITRATE: i32 = 128_000;
 const AV_ASSET_READER_STATUS_FAILED: isize = 3;
 const AV_ASSET_WRITER_STATUS_FAILED: isize = 3;
 const AV_ASSET_WRITER_STATUS_COMPLETED: isize = 2;
-
-/// CMFormatDescription media subtypes the probe recognises on a source track.
-const MEDIA_SUBTYPE_AVC1: u32 = 0x6176_6331; // 'avc1'
-const MEDIA_SUBTYPE_AVC3: u32 = 0x6176_6333; // 'avc3'
-const MEDIA_SUBTYPE_HVC1: u32 = 0x6876_6331; // 'hvc1'
-const MEDIA_SUBTYPE_HEV1: u32 = 0x6865_7631; // 'hev1'
 
 // ---------------------------------------------------------------------------
 // FFI — Objective-C runtime
@@ -216,7 +210,6 @@ extern "C" {
     static AVVideoWidthKey: CFStringRef;
     static AVVideoHeightKey: CFStringRef;
     static AVVideoCompressionPropertiesKey: CFStringRef;
-    static AVVideoAverageBitRateKey: CFStringRef;
     static AVVideoProfileLevelKey: CFStringRef;
     static AVVideoProfileLevelH264MainAutoLevel: CFStringRef;
     static AVFormatIDKey: CFStringRef;
@@ -230,15 +223,6 @@ extern "C" {
 #[link(name = "VideoToolbox", kind = "framework")]
 extern "C" {
     static kVTCompressionPropertyKey_Quality: CFStringRef;
-}
-
-// ---------------------------------------------------------------------------
-// FFI — CoreMedia
-// ---------------------------------------------------------------------------
-
-#[link(name = "CoreMedia", kind = "framework")]
-extern "C" {
-    fn CMFormatDescriptionGetMediaSubType(desc: CFTypeRef) -> u32;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,90 +400,6 @@ pub fn compress_file(
     unsafe { transcode(input, output, H264Target::compress(options)) }
 }
 
-/// Convert `input` to H.264/MP4 unless its video track is already H.264 within
-/// the size limits. HEVC is re-encoded like any other codec.
-pub fn convert_file(
-    input: &Path,
-    output: &Path,
-    options: VideoConvertOptions,
-) -> Result<VideoConvertOutcome, Error> {
-    let probe = unsafe { probe_video(input)? };
-
-    if let Some(codec) = compliant_codec(probe.codec, probe.width, probe.height, options) {
-        return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
-    }
-
-    unsafe { transcode(input, output, H264Target::convert(options)) }?;
-    Ok(VideoConvertOutcome::Converted)
-}
-
-/// Codec and display size of the first video track.
-struct VideoProbe {
-    codec: Option<VideoCodec>,
-    width: u32,
-    height: u32,
-}
-
-unsafe fn probe_video(path: &Path) -> Result<VideoProbe, Error> {
-    let _pool = AutoreleasePool::new();
-
-    let url = file_url(path)?;
-    let result = (|| {
-        let asset = msg_id2(
-            class(c"AVURLAsset"),
-            sel(c"URLAssetWithURL:options:"),
-            url as Id,
-            std::ptr::null_mut(),
-        );
-        if asset.is_null() {
-            return Err(Error::DecodeError("AVURLAsset creation failed".into()));
-        }
-
-        let tracks = msg_id1(asset, sel(c"tracksWithMediaType:"), AVMediaTypeVideo as Id);
-        if tracks.is_null() || msg_usize(tracks, sel(c"count")) == 0 {
-            return Err(Error::DecodeError("no video track found".into()));
-        }
-
-        let track = msg_id(tracks, sel(c"firstObject"));
-        let size = msg_size(track, sel(c"naturalSize"));
-        let width = size.width.max(0.0) as u32;
-        let height = size.height.max(0.0) as u32;
-        if width == 0 || height == 0 {
-            return Err(Error::DecodeError("video track has zero dimensions".into()));
-        }
-
-        let (width, height) = display_size_u32(width, height, track_preferred_transform(track));
-
-        Ok(VideoProbe {
-            codec: video_codec(track),
-            width,
-            height,
-        })
-    })();
-    CFRelease(url);
-
-    result
-}
-
-/// `CMFormatDescription` subtype of `track`, mapped to the recognised codecs.
-unsafe fn video_codec(track: Id) -> Option<VideoCodec> {
-    let descriptions = msg_id(track, sel(c"formatDescriptions"));
-    if descriptions.is_null() || msg_usize(descriptions, sel(c"count")) == 0 {
-        return None;
-    }
-
-    let description = msg_id(descriptions, sel(c"firstObject"));
-    if description.is_null() {
-        return None;
-    }
-
-    match CMFormatDescriptionGetMediaSubType(description as CFTypeRef) {
-        MEDIA_SUBTYPE_AVC1 | MEDIA_SUBTYPE_AVC3 => Some(VideoCodec::H264),
-        MEDIA_SUBTYPE_HVC1 | MEDIA_SUBTYPE_HEV1 => Some(VideoCodec::Hevc),
-        _ => None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Transcode implementation
 // ---------------------------------------------------------------------------
@@ -540,12 +440,7 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
         // it here and fold it into the layer instruction below.
         let preferred = track_preferred_transform(video_track);
         let (display_w, display_h) = display_size_u32(src_w, src_h, preferred);
-        let (target_w, target_h) = compute_video_target_dimensions(
-            display_w,
-            display_h,
-            target.max_width,
-            target.max_height,
-        );
+        let (target_w, target_h) = compute_video_target_dimensions(display_w, display_h);
 
         // ── Optional audio track ─────────────────────────────────────────
         let audio_tracks = msg_id1(asset, sel(c"tracksWithMediaType:"), AVMediaTypeAudio as Id);
@@ -704,38 +599,12 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
 
         let w_num = cf_number_i32(target_w as i32);
         let h_num = cf_number_i32(target_h as i32);
-        let compression = if let Some(crf) = target.crf() {
-            let quality_num = cf_number_f32(crf_to_quality_unit(crf));
-            let properties = cf_dictionary(
-                &[
-                    kVTCompressionPropertyKey_Quality as *const c_void,
-                    AVVideoProfileLevelKey,
-                ],
-                &[
-                    quality_num as *const c_void,
-                    AVVideoProfileLevelH264MainAutoLevel,
-                ],
-            );
-            CFRelease(quality_num);
-            properties
-        } else {
-            let estimated = msg_float(video_track, sel(c"estimatedDataRate"));
-            let source_bitrate_bps =
-                (estimated.is_finite() && estimated >= 1.0).then(|| estimated as u32);
-            let bitrate_bps = target.resolve_bitrate_bps(
-                source_bitrate_bps,
-                (display_w, display_h),
-                (target_w, target_h),
-                timescale as u32,
-            );
-            let bitrate_num = cf_number_i32(bitrate_bps.min(i32::MAX as u32) as i32);
-            let properties = cf_dictionary(
-                &[AVVideoAverageBitRateKey, AVVideoProfileLevelKey],
-                &[bitrate_num, AVVideoProfileLevelH264MainAutoLevel],
-            );
-            CFRelease(bitrate_num);
-            properties
-        };
+        let quality_num = cf_number_f32(crf_to_quality_unit(target.crf));
+        let compression = cf_dictionary(
+            &[kVTCompressionPropertyKey_Quality, AVVideoProfileLevelKey],
+            &[quality_num, AVVideoProfileLevelH264MainAutoLevel],
+        );
+        CFRelease(quality_num);
         let video_settings = cf_dictionary(
             &[
                 AVVideoCodecKey,

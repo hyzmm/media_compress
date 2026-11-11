@@ -4,10 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::rgb;
-use super::{
-    compliant_codec, compute_video_target_dimensions, H264Target, VideoCodec, VideoCompressOptions,
-    VideoConvertOptions, VideoConvertOutcome, VideoFormat,
-};
+use super::{compute_video_target_dimensions, H264Target, VideoCompressOptions, VideoFormat};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -73,8 +70,6 @@ const MF_MEDIA_TYPE_VIDEO: GUID = fourcc_guid(0x7364_6976);
 const MF_MEDIA_TYPE_AUDIO: GUID = fourcc_guid(0x7364_7561);
 /// MFVideoFormat_H264 ('H264').
 const MF_VIDEO_FORMAT_H264: GUID = fourcc_guid(0x3436_3248);
-/// MFVideoFormat_HEVC ('HEVC').
-const MF_VIDEO_FORMAT_HEVC: GUID = fourcc_guid(0x4356_4548);
 /// MFVideoFormat_RGB32 (D3DFMT_X8R8G8B8 = 22).
 const MF_VIDEO_FORMAT_RGB32: GUID = fourcc_guid(0x0000_0016);
 /// MFVideoFormat_NV12 ('NV12').
@@ -318,27 +313,6 @@ unsafe fn attr_get_u32(p: *mut c_void, key: &GUID) -> Result<u32, HRESULT> {
     }
 }
 
-unsafe fn attr_get_guid(p: *mut c_void, key: &GUID) -> Result<GUID, HRESULT> {
-    let mut v = GUID {
-        data1: 0,
-        data2: 0,
-        data3: 0,
-        data4: [0; 8],
-    };
-    let hr = com_call!(
-        p,
-        10,
-        unsafe extern "system" fn(*mut c_void, *const GUID, *mut GUID) -> HRESULT,
-        key,
-        &mut v
-    );
-    if hr == S_OK {
-        Ok(v)
-    } else {
-        Err(hr)
-    }
-}
-
 // MF_MT_FRAME_SIZE / MF_MT_FRAME_RATE / MF_MT_PIXEL_ASPECT_RATIO are packed
 // UINT64 values. Following `Pack2UINT32AsUINT64` in mfapi.h, the FIRST value
 // (width / numerator) goes in the HIGH 32 bits and the second (height /
@@ -427,21 +401,6 @@ fn unique_temp_path(ext: &str) -> PathBuf {
         nanos,
         ext
     ))
-}
-
-fn guid_eq(a: &GUID, b: &GUID) -> bool {
-    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
-}
-
-/// Map a native video subtype to the codecs the probe recognises.
-fn video_codec(subtype: &GUID) -> Option<VideoCodec> {
-    if guid_eq(subtype, &MF_VIDEO_FORMAT_H264) {
-        Some(VideoCodec::H264)
-    } else if guid_eq(subtype, &MF_VIDEO_FORMAT_HEVC) {
-        Some(VideoCodec::Hevc)
-    } else {
-        None
-    }
 }
 
 fn detected_extension(input: &[u8]) -> &'static str {
@@ -818,7 +777,6 @@ struct SourceSetup {
     src_h: u32,
     fps_num: u32,
     fps_den: u32,
-    source_bitrate: Option<u32>,
     has_audio: bool,
     layout: DecodedLayout,
     matrix: rgb::YuvMatrix,
@@ -932,9 +890,6 @@ unsafe fn configure_source(
         Ok((n, d)) if n > 0 && d > 0 => (n, d),
         _ => (DEFAULT_FRAME_RATE, 1),
     };
-    let source_bitrate = attr_get_u32(native, &MF_MT_AVG_BITRATE)
-        .ok()
-        .filter(|value| *value > 0);
     let yuv_matrix = attr_get_u32(native, &MF_MT_YUV_MATRIX).ok();
     let full_range =
         attr_get_u32(native, &MF_MT_VIDEO_NOMINAL_RANGE).ok() == Some(MF_NOMINAL_RANGE_0_255);
@@ -1033,7 +988,6 @@ unsafe fn configure_source(
         src_h,
         fps_num,
         fps_den,
-        source_bitrate,
         has_audio,
         layout,
         matrix,
@@ -1082,84 +1036,6 @@ pub fn compress_file(
     transcode(input, output, H264Target::compress(options))
 }
 
-/// Convert `input` to H.264/MP4 unless its video track is already H.264 within
-/// the size limits. HEVC is re-encoded like any other codec.
-pub fn convert_file(
-    input: &Path,
-    output: &Path,
-    options: VideoConvertOptions,
-) -> Result<VideoConvertOutcome, Error> {
-    let probe = probe_video(input)?;
-
-    if let Some(codec) = compliant_codec(probe.codec, probe.width, probe.height, options) {
-        return Ok(VideoConvertOutcome::AlreadyCompliant(codec));
-    }
-
-    transcode(input, output, H264Target::convert(options))?;
-    Ok(VideoConvertOutcome::Converted)
-}
-
-/// Codec and display size of the first video stream.
-struct VideoProbe {
-    codec: Option<VideoCodec>,
-    width: u32,
-    height: u32,
-}
-
-fn probe_video(path: &Path) -> Result<VideoProbe, Error> {
-    let url = wide_path(path);
-
-    unsafe {
-        let hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-        if !hres_ok(hr) {
-            return Err(err_encode("MFStartup", hr));
-        }
-
-        let result = probe_video_impl(&url);
-
-        MFShutdown();
-        result
-    }
-}
-
-unsafe fn probe_video_impl(url: &[u16]) -> Result<VideoProbe, Error> {
-    let mut reader: *mut c_void = std::ptr::null_mut();
-    let hr = MFCreateSourceReaderFromURL(url.as_ptr(), std::ptr::null_mut(), &mut reader);
-    if !hres_ok(hr) || reader.is_null() {
-        return Err(err_decode("MFCreateSourceReaderFromURL", hr));
-    }
-
-    let mut native: *mut c_void = std::ptr::null_mut();
-    let hr = com_call!(
-        reader,
-        5,
-        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-        0u32,
-        &mut native
-    );
-    if !hres_ok(hr) || native.is_null() {
-        release_com(reader);
-        return Err(err_decode("GetNativeMediaType (video)", hr));
-    }
-
-    let size = attr_get_size(native, &MF_MT_FRAME_SIZE);
-    let codec = attr_get_guid(native, &MF_MT_SUBTYPE).map(|subtype| video_codec(&subtype));
-    release_com(native);
-    release_com(reader);
-
-    let (width, height) = size.map_err(|hr| err_decode("GetUINT64 (MF_MT_FRAME_SIZE)", hr))?;
-    if width == 0 || height == 0 {
-        return Err(err_decode("video stream has zero dimensions", -1));
-    }
-
-    Ok(VideoProbe {
-        codec: codec.map_err(|hr| err_decode("GetGUID (MF_MT_SUBTYPE)", hr))?,
-        width,
-        height,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Transcode implementation
 // ---------------------------------------------------------------------------
@@ -1198,7 +1074,6 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
         src_h,
         fps_num,
         fps_den,
-        source_bitrate,
         has_audio,
         layout,
         matrix,
@@ -1206,14 +1081,12 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
         first_video,
     } = setup;
 
-    let (target_w, target_h) =
-        compute_video_target_dimensions(src_w, src_h, target.max_width, target.max_height);
+    let (target_w, target_h) = compute_video_target_dimensions(src_w, src_h);
     let fps = (fps_num as u64 + fps_den as u64 - 1) / fps_den as u64; // ceil
     let fps = fps.clamp(1, u32::MAX as u64) as u32;
     // Media Foundation's sink writer only exposes average-bitrate control, so
-    // CRF targets are converted to an equivalent VBR bitrate here.
-    let bitrate_bps =
-        target.resolve_bitrate_bps(source_bitrate, (src_w, src_h), (target_w, target_h), fps);
+    // the CRF target is converted to an equivalent VBR bitrate here.
+    let bitrate_bps = H264Target::crf_fallback_bitrate_bps(target_w, target_h, fps, target.crf);
 
     // ── Sink writer ──────────────────────────────────────────────────────
     let mut writer: *mut c_void = std::ptr::null_mut();
