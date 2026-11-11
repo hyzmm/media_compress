@@ -6,6 +6,7 @@
 //!   - libwebp (`webp` crate = libwebp-sys C) at method 4, thread_level 0 and 1
 //!     (thread_level 1 matches the production setting in webp_encode.rs)
 //!   - zenwebp (pure Rust) at method 4; it has no thread knob (single-threaded)
+//!    
 //! All WebP outputs are decoded with libwebp for PSNR against the source, so
 //! both encoders are judged by one common decoder.
 //!
@@ -77,7 +78,8 @@ fn main() {
             Ok(v) => v,
             // Some exotic TIFFs (e.g. RGBPalette photometric) are not supported
             // by the pure-Rust decoder; retry through sips like HEIC.
-            Err(first_err) => match convert_to_png(&prepared, tmp).and_then(|p| load_rgba(&p).ok()) {
+            Err(first_err) => match convert_to_png(&prepared, tmp).and_then(|p| load_rgba(&p).ok())
+            {
                 Some(v) => v,
                 None => {
                     println!("skip {label}: {first_err}\n");
@@ -87,8 +89,12 @@ fn main() {
         };
 
         let mpx = w as f64 * h as f64 / 1e6;
-        let has_alpha = rgba.chunks_exact(4).any(|p| p[3] != 255);
-        let iters = if w as u64 * h as u64 > 8_000_000 { 3 } else { 5 };
+        let has_alpha = rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255);
+        let iters = if w as u64 * h as u64 > 8_000_000 {
+            3
+        } else {
+            5
+        };
 
         println!(
             "{label}  {w}x{h} ({mpx:.1} MP)  src file {}  q={QUALITY}{}",
@@ -104,8 +110,20 @@ fn main() {
         let p_lw_mt = psnr_vs_source(&rgba, &out_lw_mt, label);
         let p_zw = psnr_vs_source(&rgba, &out_zw, label);
 
-        row("libwebp tl=0", out_lw_st.len(), src_file_len, p_lw_st, t_lw_st);
-        row("libwebp tl=1", out_lw_mt.len(), src_file_len, p_lw_mt, t_lw_mt);
+        row(
+            "libwebp tl=0",
+            out_lw_st.len(),
+            src_file_len,
+            p_lw_st,
+            t_lw_st,
+        );
+        row(
+            "libwebp tl=1",
+            out_lw_mt.len(),
+            src_file_len,
+            p_lw_mt,
+            t_lw_mt,
+        );
         row("zenwebp", out_zw.len(), src_file_len, p_zw, t_zw);
         println!("  (median of {iters} runs, warmup excluded)\n");
 
@@ -143,7 +161,9 @@ fn sweep(tmp: &Path) {
         .ok();
 
     println!("====== quality sweep: {SWEEP_SOURCE}  {w}x{h} ======");
-    println!("  q     libwebp tl=0                        zenwebp                             delta");
+    println!(
+        "  q     libwebp tl=0                        zenwebp                             delta"
+    );
     for &q in SWEEP_QUALITIES {
         let (out_lw, t_lw) = bench(3, || libwebp_encode(&rgba, w, h, q, 0));
         let (out_zw, t_zw) = bench(3, || zenwebp_encode(&rgba, w, h, q));
@@ -188,7 +208,11 @@ fn dump_rgba(label: &str, tmp: &Path) {
     };
     let out = tmp.join(format!("{label}.rgba"));
     std::fs::write(&out, &rgba).expect("write rgba");
-    println!("{label}: {w}x{h} ({} bytes) -> {}", rgba.len(), out.display());
+    println!(
+        "{label}: {w}x{h} ({} bytes) -> {}",
+        rgba.len(),
+        out.display()
+    );
 }
 
 fn row(name: &str, out_len: usize, src_file_len: Option<usize>, psnr: f64, ms: f64) {
@@ -246,7 +270,11 @@ fn psnr_vs_source(reference_rgba: &[u8], webp_bytes: &[u8], label: &str) -> f64 
         .unwrap_or_else(|| panic!("{label}: libwebp could not decode the output"));
     let dec: &[u8] = &img;
     let n = img.width() as usize * img.height() as usize;
-    assert_eq!(n * 4, reference_rgba.len(), "{label}: decoded size mismatch");
+    assert_eq!(
+        n * 4,
+        reference_rgba.len(),
+        "{label}: decoded size mismatch"
+    );
     let step = if img.is_alpha() { 4 } else { 3 };
 
     let mut sse = 0f64;
@@ -293,7 +321,7 @@ fn load_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
 
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
-    for p in rgb.chunks_exact(3) {
+    for p in rgb.as_chunks::<3>().0 {
         out.extend_from_slice(&[p[0], p[1], p[2], 255]);
     }
     out
@@ -302,7 +330,9 @@ fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
 /// HEIC needs ImageIO — convert to PNG via `sips` (macOS) into the target dir.
 fn prepare_input(path: &str, tmp: &Path) -> Option<PathBuf> {
     let p = Path::new(path);
-    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("heic")) {
+    if p.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("heic"))
+    {
         convert_to_png(p, tmp)
     } else {
         Some(p.to_path_buf())

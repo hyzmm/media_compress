@@ -131,7 +131,7 @@ fn semi_planar_to_i420(
         let Some(line) = src.get(start..start + 2 * cw) else {
             return Vec::new();
         };
-        for pair in line.chunks_exact(2) {
+        for pair in line.as_chunks::<2>().0 {
             if swap_uv {
                 u.push(pair[1]);
                 v.push(pair[0]);
@@ -492,7 +492,8 @@ mod tests {
         let (ys, cs) = i420_planes(4, 4);
         let src = vec![128u8; ys + 2 * cs];
         let out = scale_i420(&src, 4, 4, 2, 2);
-        assert_eq!(out.len(), 2 * 2 + 2 * 1 * 1);
+        let (out_ys, out_cs) = i420_planes(2, 2);
+        assert_eq!(out.len(), out_ys + 2 * out_cs);
     }
 
     #[test]

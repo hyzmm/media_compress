@@ -185,7 +185,7 @@ unsafe fn decode_frame(src: CGImageSourceRef, index: usize) -> Result<(Vec<u8>, 
 
     // CoreGraphics fills the buffer as BGRA (native ARM little-endian format).
     // Swap B and R in-place to produce RGBA.
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         chunk.swap(0, 2); // BGRA → RGBA
     }
 

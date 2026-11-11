@@ -150,8 +150,8 @@ mod tests {
         }
         let out = scale_bgra(&src, 8, 8, 3, 5);
         assert_eq!(out.len(), 3 * 5 * 4);
-        for chunk in out.chunks_exact(4) {
-            assert_eq!(chunk, px);
+        for chunk in out.as_chunks::<4>().0 {
+            assert_eq!(chunk, &px);
         }
     }
 
@@ -167,11 +167,11 @@ mod tests {
         // 2x2 NV12: Y = 16 (black level), neutral chroma.
         let src = [16u8, 16, 16, 16, 128, 128];
         let out = nv12_to_bgra(&src, 2, 2, 2, YuvMatrix::Bt709, false);
-        assert_eq!(out, vec![0, 0, 0, 255].repeat(4));
+        assert_eq!(out, [0, 0, 0, 255].repeat(4));
 
         let src = [235u8, 235, 235, 235, 128, 128];
         let out = nv12_to_bgra(&src, 2, 2, 2, YuvMatrix::Bt709, false);
-        assert_eq!(out, vec![255, 255, 255, 255].repeat(4));
+        assert_eq!(out, [255, 255, 255, 255].repeat(4));
     }
 
     #[test]
@@ -194,8 +194,8 @@ mod tests {
         let out = nv12_to_bgra(&src, 2, 2, 4, YuvMatrix::Bt601, false);
         assert_eq!(out.len(), 16);
         // Y=100 with neutral chroma -> 1.164 * (100 - 16) = 97.8 -> 98.
-        for px in out.chunks_exact(4) {
-            assert_eq!(px, [98, 98, 98, 255]);
+        for px in out.as_chunks::<4>().0 {
+            assert_eq!(px, &[98u8, 98, 98, 255]);
         }
     }
 

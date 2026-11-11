@@ -66,7 +66,7 @@ fn run_input(label: &str, path: &str, quality: u8) {
     let has_alpha = src
         .frames
         .iter()
-        .any(|(_, p)| p.chunks_exact(4).any(|px| px[3] != 255));
+        .any(|(_, p)| p.as_chunks::<4>().0.iter().any(|px| px[3] != 255));
     let delays_cs: Vec<u16> = src.frames.iter().map(|f| f.0).collect();
 
     println!(
@@ -341,7 +341,9 @@ fn psnr_frames(a: &[(u16, Vec<u8>)], b: &[(u16, Vec<u8>)]) -> (String, usize) {
         if fa.1.len() != fb.1.len() {
             return ("pixel size mismatch".into(), 0);
         }
-        for (pa, pb) in fa.1.chunks_exact(4).zip(fb.1.chunks_exact(4)) {
+        let pa_chunks = fa.1.as_chunks::<4>().0;
+        let pb_chunks = fb.1.as_chunks::<4>().0;
+        for (pa, pb) in pa_chunks.iter().zip(pb_chunks.iter()) {
             for c in 0..3 {
                 let d = pa[c] as f64 - pb[c] as f64;
                 sse += d * d;

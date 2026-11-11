@@ -210,7 +210,7 @@ pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>,
     if may_fallback && compressed.len() > input.len() {
         return Ok(input.to_vec());
     }
-    return Ok(compressed);
+    Ok(compressed)
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ pub fn apply_exif_orientation_rgba(
         return (pixels, width, height);
     }
 
-    let (dst_w, dst_h) = if matches!(orientation, 5 | 6 | 7 | 8) {
+    let (dst_w, dst_h) = if matches!(orientation, 5..=8) {
         (height, width)
     } else {
         (width, height)
