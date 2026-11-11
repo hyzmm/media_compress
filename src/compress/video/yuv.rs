@@ -24,6 +24,10 @@ pub struct CropRect {
 impl CropRect {
     /// Rounds the visible region down to even dimensions, dropping the last
     /// row/column when the source is odd sized.
+    ///
+    /// Only MediaCodec crop rects can be odd sized; on the host this module is
+    /// compiled just for its unit tests.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn even(self) -> Self {
         Self {
             left: self.left,

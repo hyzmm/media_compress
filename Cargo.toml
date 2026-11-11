@@ -13,7 +13,6 @@ harness = []
 
 [dependencies]
 thiserror = "2"
-anyhow = "1"
 # GIF codec: decode + re-encode as GIF (all platforms, including wasm).
 # quantette is MIT/Apache-2.0; zengif's default `zenquant` quantizer is
 # AGPL-3.0-or-later, so it is deliberately not enabled.
