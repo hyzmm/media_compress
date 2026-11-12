@@ -515,7 +515,20 @@ impl VideoLayout {
             return None;
         }
 
-        let crop = crop_rect(fmt, width, height);
+        // API 28 decoders can omit the crop keys while the coded frame is
+        // alignment-padded (for example 1920x1088 for a 1920x1080 track).
+        // Without them the container size is the visible region; using the
+        // full coded size would include padding and stretch the picture.
+        let has_crop_keys = [c"crop-left", c"crop-top", c"crop-right", c"crop-bottom"]
+            .into_iter()
+            .any(|key| format_i32(fmt, key).is_some());
+        let crop = if has_crop_keys {
+            crop_rect(fmt, width, height)
+        } else if fallback.crop.width <= width && fallback.crop.height <= height {
+            fallback.crop
+        } else {
+            crop_rect(fmt, width, height)
+        };
         if crop.width == 0 || crop.height == 0 {
             return None;
         }
@@ -551,6 +564,34 @@ struct PendingSample {
     data: Vec<u8>,
     pts: i64,
     flags: u32,
+}
+
+/// Keeps muxer timestamps strictly increasing per track.
+///
+/// Some encoders (observed on API 28) emit the last real frame with the
+/// end-of-stream input timestamp we queued (0). Writing that sample after the
+/// rest of the track moves its clock backwards, which makes `AMediaMuxer_stop`
+/// fail with an unknown error. Late samples are moved one typical frame step
+/// past the previous one instead.
+#[derive(Default)]
+struct TrackTimestamps {
+    last: Option<i64>,
+    step: i64,
+}
+
+impl TrackTimestamps {
+    fn sanitize(&mut self, pts: i64) -> i64 {
+        let pts = match self.last {
+            None => pts.max(0),
+            Some(last) if pts > last => pts,
+            Some(last) => last + self.step.max(1),
+        };
+        if let Some(last) = self.last {
+            self.step = (pts - last).max(1);
+        }
+        self.last = Some(pts);
+        pts
+    }
 }
 
 unsafe fn transcode_fd(
@@ -637,6 +678,9 @@ unsafe fn transcode_fd(
         .map_or(DEFAULT_CHANNELS, |t| t.channel_count);
     let mut pending_audio_pcm: Option<(Vec<u8>, i64)> = None;
     let mut pending_audio_samples: Vec<PendingSample> = Vec::new();
+
+    let mut video_mux_timestamps = TrackTimestamps::default();
+    let mut audio_mux_timestamps = TrackTimestamps::default();
 
     let mut last_progress = Instant::now();
 
@@ -796,12 +840,19 @@ unsafe fn transcode_fd(
                                 Error::EncodeError("video encoder output buffer unavailable".into())
                             })?;
                         let data = output_slice(ptr, capacity, &info)?;
+                        let pts = video_mux_timestamps.sanitize(info.presentation_time_us);
                         if muxer_started {
-                            write_sample(muxer.ptr, video_track_index as usize, data, &info)?;
+                            write_sample(
+                                muxer.ptr,
+                                video_track_index as usize,
+                                data,
+                                pts,
+                                info.flags,
+                            )?;
                         } else {
                             pending_video_samples.push(PendingSample {
                                 data: data.to_vec(),
-                                pts: info.presentation_time_us,
+                                pts,
                                 flags: info.flags,
                             });
                         }
@@ -924,12 +975,19 @@ unsafe fn transcode_fd(
                                 Error::EncodeError("audio encoder output buffer unavailable".into())
                             })?;
                             let data = output_slice(ptr, capacity, &info)?;
+                            let pts = audio_mux_timestamps.sanitize(info.presentation_time_us);
                             if muxer_started {
-                                write_sample(muxer.ptr, audio_track_index as usize, data, &info)?;
+                                write_sample(
+                                    muxer.ptr,
+                                    audio_track_index as usize,
+                                    data,
+                                    pts,
+                                    info.flags,
+                                )?;
                             } else {
                                 pending_audio_samples.push(PendingSample {
                                     data: data.to_vec(),
-                                    pts: info.presentation_time_us,
+                                    pts,
                                     flags: info.flags,
                                 });
                             }
@@ -1420,13 +1478,14 @@ unsafe fn write_sample(
     muxer: *mut AMediaMuxer,
     track_index: usize,
     data: &[u8],
-    info: &AMediaCodecBufferInfo,
+    pts: i64,
+    flags: u32,
 ) -> Result<(), Error> {
     let info = AMediaCodecBufferInfo {
         offset: 0,
         size: data.len() as i32,
-        presentation_time_us: info.presentation_time_us,
-        flags: info.flags,
+        presentation_time_us: pts,
+        flags,
     };
     let ret = AMediaMuxer_writeSampleData(muxer, track_index, data.as_ptr(), &info);
     if ret != AMEDIA_OK {
