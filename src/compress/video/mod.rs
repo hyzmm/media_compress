@@ -95,11 +95,12 @@ pub(crate) const MAX_CRF: f32 = 51.0;
 pub struct VideoCompressOptions {
     /// x264-style CRF, 0–51. Lower keeps more quality, higher compresses more.
     pub crf: f32,
-    /// Reserved for future downscaling. Ignored by the compression path for
-    /// now: output keeps the source dimensions.
+    /// Preferred upper bound for a fallback downscale. The encoder normally
+    /// keeps the source dimensions; the Android backend shrinks to fit only
+    /// when its encoder rejects the source size (for example a 1344×2992
+    /// screen recording on an encoder capped below that).
     pub max_width: Option<u32>,
-    /// Reserved for future downscaling. Ignored by the compression path for
-    /// now: output keeps the source dimensions.
+    /// Preferred upper bound for a fallback downscale. See [`Self::max_width`].
     pub max_height: Option<u32>,
 }
 
@@ -123,14 +124,22 @@ impl Default for VideoCompressOptions {
 pub(crate) struct H264Target {
     /// Normalized x264-style CRF.
     pub(crate) crf: f32,
+    /// Preferred fallback width when the source size is not encodable.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) max_width: Option<u32>,
+    /// Preferred fallback height when the source size is not encodable.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) max_height: Option<u32>,
 }
 
 impl H264Target {
-    /// CRF compression target. `max_width`/`max_height` are deliberately not
-    /// applied yet: the output keeps the source dimensions.
+    /// CRF compression target. Size limits are kept as fallback hints only:
+    /// the output normally keeps the source dimensions.
     pub(crate) fn compress(options: VideoCompressOptions) -> Self {
         Self {
             crf: normalized_crf(options.crf),
+            max_width: options.max_width.filter(|value| *value >= 2),
+            max_height: options.max_height.filter(|value| *value >= 2),
         }
     }
 
@@ -178,6 +187,42 @@ pub(crate) fn compute_video_target_dimensions(src_w: u32, src_h: u32) -> (u32, u
 
     // Round down to even (>= 2) for H.264.
     ((src_w.max(2) / 2) * 2, (src_h.max(2) / 2) * 2)
+}
+
+/// Shrink `src` to fit inside `max_w` × `max_h`, preserving aspect ratio and
+/// rounding down to H.264-friendly even dimensions. Never enlarges. Used only
+/// when an encoder rejects the source size.
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub(crate) fn fit_video_dimensions(
+    src_w: u32,
+    src_h: u32,
+    max_w: Option<u32>,
+    max_h: Option<u32>,
+) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 {
+        return (src_w, src_h);
+    }
+
+    let mut width = src_w.max(2) as u64;
+    let mut height = src_h.max(2) as u64;
+
+    if let Some(limit) = max_w.filter(|value| *value >= 2) {
+        let limit = limit as u64;
+        if width > limit {
+            height = ((height * limit + width / 2) / width).max(2);
+            width = limit;
+        }
+    }
+    if let Some(limit) = max_h.filter(|value| *value >= 2) {
+        let limit = limit as u64;
+        if height > limit {
+            width = ((width * limit + height / 2) / height).max(2);
+            height = limit;
+        }
+    }
+
+    let even = |value: u64| ((value.max(2) / 2) * 2).min(u32::MAX as u64) as u32;
+    (even(width), even(height))
 }
 
 /// Compress a video file directly from `input` to `output`.
@@ -251,8 +296,9 @@ fn read_header(path: &Path) -> Result<Vec<u8>, Error> {
 /// # Arguments
 /// * `input`   — raw bytes of the source video
 /// * `options` — `crf` quality target (x264-style 0–51). `max_width` /
-///   `max_height` are reserved and not applied yet; output keeps the source
-///   dimensions. Audio is re-encoded to AAC when present.
+///   `max_height` are preferred fallback bounds used by the Android backend
+///   only when its encoder rejects the source size; otherwise the output keeps
+///   the source dimensions. Audio is re-encoded to AAC when present.
 ///
 /// The re-encode is returned even when it is larger than `input`; callers that
 /// need a size guarantee should decide after comparing lengths themselves.
@@ -329,8 +375,8 @@ fn compress_video_file_platform(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_video_target_dimensions, crf_to_quality_100, crf_to_quality_unit, H264Target,
-        VideoCompressOptions, DEFAULT_CRF,
+        compute_video_target_dimensions, crf_to_quality_100, crf_to_quality_unit,
+        fit_video_dimensions, H264Target, VideoCompressOptions, DEFAULT_CRF,
     };
 
     #[test]
@@ -345,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn compression_ignores_size_limits_and_keeps_source_dimensions() {
+    fn size_limits_are_fallback_hints_not_always_applied() {
         let target = H264Target::compress(VideoCompressOptions {
             crf: 28.0,
             max_width: Some(640),
@@ -353,7 +399,34 @@ mod tests {
         });
 
         assert_eq!(target.crf, 28.0);
+        assert_eq!(target.max_width, Some(640));
+        assert_eq!(target.max_height, Some(360));
+        // A normal source keeps its dimensions even when limits are supplied.
         assert_eq!(compute_video_target_dimensions(3840, 2160), (3840, 2160));
+    }
+
+    #[test]
+    fn fallback_fit_preserves_aspect_and_even_dimensions() {
+        // Pixel 9 Pro XL screen recording: 1344x2992 does not fit some H.264
+        // encoders, so the fallback lands at 862x1920.
+        assert_eq!(
+            fit_video_dimensions(1344, 2992, Some(1920), Some(1920)),
+            (862, 1920)
+        );
+        // The old 720p cap used by the Android harness keeps the same result
+        // as the removed size-limit math: 404x720.
+        assert_eq!(
+            fit_video_dimensions(1080, 1920, Some(1280), Some(720)),
+            (404, 720)
+        );
+        assert_eq!(
+            fit_video_dimensions(800, 600, Some(1920), Some(1920)),
+            (800, 600)
+        );
+        assert_eq!(
+            fit_video_dimensions(1921, 1081, Some(1920), None),
+            (1920, 1080)
+        );
     }
 
     #[test]

@@ -5,7 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::yuv::{self, CropRect};
 use super::{
-    compute_video_target_dimensions, crf_to_quality_100, H264Target, VideoCompressOptions,
+    compute_video_target_dimensions, crf_to_quality_100, fit_video_dimensions, H264Target,
+    VideoCompressOptions,
 };
 use crate::error::Error;
 
@@ -579,14 +580,6 @@ unsafe fn transcode_fd(
         90 | 270 => (video_track.crop.height, video_track.crop.width),
         _ => (video_track.crop.width, video_track.crop.height),
     };
-    let (target_w, target_h) = compute_video_target_dimensions(display_w as u32, display_h as u32);
-    let (target_w, target_h) = (target_w as usize, target_h as usize);
-    let bitrate_bps = H264Target::crf_fallback_bitrate_bps(
-        target_w as u32,
-        target_h as u32,
-        video_track.frame_rate as u32,
-        target.crf,
-    );
 
     AMediaExtractor_selectTrack(extractor.0, video_track.index);
     if let Some(track) = &audio_track {
@@ -597,13 +590,8 @@ unsafe fn transcode_fd(
     configure_from_track(&video_decoder, extractor.0, video_track.index)?;
     start_codec(&video_decoder, "video decoder")?;
 
-    let (video_encoder, encoder_color_format) = create_video_encoder(
-        target_w,
-        target_h,
-        video_track.frame_rate,
-        Some(target.crf),
-        bitrate_bps,
-    )?;
+    let (video_encoder, encoder_color_format, target_w, target_h) =
+        create_video_encoder(display_w, display_h, &target, video_track.frame_rate)?;
 
     let audio_decoder = match &audio_track {
         Some(track) => {
@@ -1060,16 +1048,56 @@ fn android_api_level() -> i32 {
         .unwrap_or(0)
 }
 
+/// Longest-side caps tried, in order, when the encoder rejects the source
+/// size. High-resolution portrait screen recordings (for example 1344x2992 on
+/// a 1344p phone) can exceed a byte-buffer H.264 encoder's maximum even when
+/// the same device records the screen through a surface encoder.
+const ENCODER_FALLBACK_CAPS: [u32; 3] = [1920, 1280, 720];
+
+/// Sizes to try for the H.264 encoder, largest first: the source size, the
+/// caller's preferred fallback bounds, then coarse 1080p/720p/480p-style caps.
+/// The first size the encoder accepts wins, so normal videos keep their source
+/// dimensions and only oversized recordings are downscaled.
+fn encoder_size_candidates(src_w: usize, src_h: usize, target: &H264Target) -> Vec<(usize, usize)> {
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    let mut push = |size: (u32, u32)| {
+        if size.0 >= 2 && size.1 >= 2 && !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    };
+
+    push(compute_video_target_dimensions(src_w as u32, src_h as u32));
+    if target.max_width.is_some() || target.max_height.is_some() {
+        push(fit_video_dimensions(
+            src_w as u32,
+            src_h as u32,
+            target.max_width,
+            target.max_height,
+        ));
+    }
+    for cap in ENCODER_FALLBACK_CAPS {
+        push(fit_video_dimensions(
+            src_w as u32,
+            src_h as u32,
+            Some(cap),
+            Some(cap),
+        ));
+    }
+
+    sizes
+        .into_iter()
+        .map(|(width, height)| (width as usize, height as usize))
+        .collect()
+}
+
 fn create_video_encoder(
-    target_w: usize,
-    target_h: usize,
+    src_w: usize,
+    src_h: usize,
+    target: &H264Target,
     frame_rate: i32,
-    crf: Option<f32>,
-    bitrate_bps: u32,
-) -> Result<(Codec, i32), Error> {
-    let bitrate_bps = bitrate_bps.clamp(100_000, i32::MAX as u32);
+) -> Result<(Codec, i32, usize, usize), Error> {
     // MediaFormat.KEY_QUALITY only exists on API 28+; older releases keep VBR.
-    let cq_crf = crf.filter(|_| android_api_level() >= 28);
+    let cq_crf = (android_api_level() >= 28).then_some(target.crf);
     let candidates: [Option<&CStr>; 3] = [
         None,
         Some(c"c2.android.avc.encoder"),
@@ -1077,48 +1105,60 @@ fn create_video_encoder(
     ];
     let mut last_error = String::from("no encoder candidates");
 
-    for candidate in candidates {
-        for color_format in VIDEO_ENCODER_COLOR_FORMATS {
-            if let Some(crf) = cq_crf {
+    for (target_w, target_h) in encoder_size_candidates(src_w, src_h, target) {
+        let bitrate_bps = H264Target::crf_fallback_bitrate_bps(
+            target_w as u32,
+            target_h as u32,
+            frame_rate.max(1) as u32,
+            target.crf,
+        )
+        .clamp(100_000, i32::MAX as u32);
+
+        for candidate in candidates {
+            for color_format in VIDEO_ENCODER_COLOR_FORMATS {
+                if let Some(crf) = cq_crf {
+                    match configure_video_encoder(
+                        candidate,
+                        color_format,
+                        target_w,
+                        target_h,
+                        frame_rate,
+                        Some(crf),
+                        bitrate_bps,
+                    ) {
+                        Ok(codec) => return Ok((codec, color_format, target_w, target_h)),
+                        Err(cq_error) => match configure_video_encoder(
+                            candidate,
+                            color_format,
+                            target_w,
+                            target_h,
+                            frame_rate,
+                            None,
+                            bitrate_bps,
+                        ) {
+                            Ok(codec) => return Ok((codec, color_format, target_w, target_h)),
+                            Err(vbr_error) => {
+                                last_error = format!(
+                                    "{target_w}x{target_h} CQ: {cq_error}; VBR: {vbr_error}"
+                                );
+                                continue;
+                            }
+                        },
+                    }
+                }
+
                 match configure_video_encoder(
                     candidate,
                     color_format,
                     target_w,
                     target_h,
                     frame_rate,
-                    Some(crf),
+                    None,
                     bitrate_bps,
                 ) {
-                    Ok(codec) => return Ok((codec, color_format)),
-                    Err(cq_error) => match configure_video_encoder(
-                        candidate,
-                        color_format,
-                        target_w,
-                        target_h,
-                        frame_rate,
-                        None,
-                        bitrate_bps,
-                    ) {
-                        Ok(codec) => return Ok((codec, color_format)),
-                        Err(vbr_error) => {
-                            last_error = format!("CQ: {cq_error}; VBR: {vbr_error}");
-                            continue;
-                        }
-                    },
+                    Ok(codec) => return Ok((codec, color_format, target_w, target_h)),
+                    Err(error) => last_error = format!("{target_w}x{target_h}: {error}"),
                 }
-            }
-
-            match configure_video_encoder(
-                candidate,
-                color_format,
-                target_w,
-                target_h,
-                frame_rate,
-                None,
-                bitrate_bps,
-            ) {
-                Ok(codec) => return Ok((codec, color_format)),
-                Err(error) => last_error = error,
             }
         }
     }

@@ -155,7 +155,7 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 - Android：通过 NDK 原生 MediaCodec + MediaMuxer（libmediandk）转码，无需调用方注入 `JavaVM`。
 - Windows：通过 Media Foundation（IMFSourceReader / IMFSinkWriter）转码。优先读取解码器的原生 NV12 输出并在 CPU 转为 RGBA——按实际缓冲长度推导 stride 与 coded 高度（解码器可能输出比显示尺寸更大的缓冲，直接按显示 stride 读取会造成逐行错位），再裁切到显示尺寸；无法识别的格式回退到 Video Processor 的 RGB32。随后编码为 H.264，音频重编码为 AAC。
 
-统一输出 H.264 + MP4，音频重编码为 AAC。视频按 x264 风格 CRF 压缩（0–51，越小画质越高、体积越大）；`max_width`/`max_height` 字段保留但当前不生效，输出保持源视频宽高。即使转码结果比原文件大（例如高码率 HEVC 源转 H.264），也保留转码结果，不回退原文件。
+统一输出 H.264 + MP4，音频重编码为 AAC。视频按 x264 风格 CRF 压缩（0–51，越小画质越高、体积越大）。输出默认保持源视频宽高；当编码器拒绝源尺寸时（例如高分屏录屏 1344×2992 超出部分 H.264 编码器的最大高度），会先尝试 `max_width`/`max_height`（未设置时用 1920/1280/720 档）等比缩小到编码器可接受的尺寸（当前由 Android 后端实现），保证转码能完成。即使转码结果比原文件大（例如高码率 HEVC 源转 H.264），也保留转码结果，不回退原文件。
 
 ```rust
 use media_compress::{compress_video, VideoCompressOptions};
@@ -169,6 +169,7 @@ std::fs::write("out.mp4", out)?;
 - 支持的源容器：MP4 / MOV（QuickTime）等平台可解码格式。
 - CRF 的平台落点：macOS / iOS 使用 VideoToolbox 的 Quality（0–1）属性；Android API 28+ 使用 MediaCodec CQ + quality，老版本回退到 CRF 等价码率；Windows 的 MF sink writer 只暴露平均码率，因此按 CRF 换算目标码率（VBR）。
 - macOS / iOS 会把视频轨的 `preferredTransform` 应用到输出，Android 读取 `rotation-degrees` 并把帧物理旋转为正向，竖屏/旋转视频都保持正确方向；Windows 暂未处理旋转元数据。
+- Android 的编码器尺寸回退：先按源尺寸配置 MediaCodec；若编码器不接受（常见于 1344×2992、1080×2400 这类竖屏录屏），再按 `max_width`/`max_height` 与 1920/1280/720 档等比缩小重试，帧在 CPU 侧同步缩放。正常尺寸的视频不会降分辨率。
 - 文件路径版 API `compress_video_file(input, output, options)` 直接读写文件，不把视频载入内存；成功即保留产物（产物更大也保留），仅在编码失败时删除产物。调用方应始终使用产物。
 
 ## Android 集成与初始化
