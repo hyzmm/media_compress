@@ -170,7 +170,7 @@ std::fs::write("out.mp4", out)?;
 - CRF 的平台落点：macOS / iOS 使用 VideoToolbox 的 Quality（0–1）属性；Android API 28+ 使用 MediaCodec CQ + quality，老版本回退到 CRF 等价码率；Windows 的 MF sink writer 只暴露平均码率，因此按 CRF 换算目标码率（VBR）。
 - macOS / iOS 会把视频轨的 `preferredTransform` 应用到输出，Android 读取 `rotation-degrees` 并把帧物理旋转为正向，竖屏/旋转视频都保持正确方向；Windows 暂未处理旋转元数据。
 - Android 的编码器尺寸回退：先按源尺寸配置 MediaCodec；若编码器不接受（常见于 1344×2992、1080×2400 这类竖屏录屏），再按 `max_width`/`max_height` 与 1920/1280/720 档等比缩小重试，帧在 CPU 侧同步缩放。正常尺寸的视频不会降分辨率。
-- 文件路径版 API `compress_video_file(input, output, options)` 直接读写文件，不把视频载入内存；成功即保留产物（产物更大也保留），仅在编码失败时删除产物。调用方应始终使用产物。
+- 文件路径版 API `compress_video_file(input, output, options)` 直接读写文件，不把视频载入内存；`input` 与 `output` 必须指向不同文件。成功即保留产物（产物更大也保留）；失败时不会删除或覆盖已有的 `output`，只清理输出目录下的临时文件。调用方应始终使用产物。
 
 ## Android 集成与初始化
 

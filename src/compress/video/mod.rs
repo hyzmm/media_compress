@@ -230,9 +230,14 @@ pub(crate) fn fit_video_dimensions(
 /// The input and output files never go through memory: the platform backend
 /// reads and writes them itself.
 ///
+/// `input` and `output` must refer to different files. The platform backend
+/// writes to a temporary file next to `output`, then replaces `output` only
+/// after the re-encode succeeds. If compression fails, an existing `output`
+/// is left untouched; only the temporary file is removed.
+///
 /// Returns `Ok(())` once `output` has been written. The re-encode is kept even
 /// when it ends up larger than `input` — the caller should use `output` as the
-/// result. `output` is only removed when encoding fails.
+/// result.
 pub fn compress_video_file(
     input: &Path,
     output: &Path,
@@ -258,15 +263,139 @@ pub fn compress_video_file(
         target_os = "windows"
     ))]
     {
+        // Never let the backend create/truncate a path that is also the input.
+        // This check runs before opening the input so `input == output` cannot
+        // destroy the source even when the file is not a valid video.
+        if same_file(input, output) {
+            return Err(Error::NativeError(
+                "input and output must refer to different files".into(),
+            ));
+        }
+
         let header = read_header(input)?;
         VideoFormat::detect(&header).ok_or_else(|| {
             Error::UnsupportedFormat("Cannot detect video format from magic bytes".into())
         })?;
 
-        compress_video_file_platform(input, output, options).inspect_err(|_| {
-            let _ = std::fs::remove_file(output);
+        write_video_atomically(input, output, |temp_output| {
+            compress_video_file_platform(input, temp_output, options)
         })
     }
+}
+
+/// Run the platform writer against a temporary sibling, then move it into
+/// place. On failure the temporary file is removed and any existing output is
+/// left untouched.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
+fn write_video_atomically<F>(input: &Path, output: &Path, write: F) -> Result<(), Error>
+where
+    F: FnOnce(&Path) -> Result<(), Error>,
+{
+    let temp_output = unique_temp_output_path(input, output)?;
+    match write(&temp_output) {
+        Ok(()) => std::fs::rename(&temp_output, output).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_output);
+            Error::EncodeError(format!(
+                "failed to replace output video {}: {e}",
+                output.display()
+            ))
+        }),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_output);
+            Err(e)
+        }
+    }
+}
+
+/// Whether two paths point at the same file.
+///
+/// A textual comparison catches the common case; metadata/hard-link and
+/// symlink aliases are caught by inode comparison on Unix and canonicalization
+/// elsewhere. Missing paths simply compare as different.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
+                return true;
+            }
+        }
+    }
+
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Build a unique temporary path in the same directory as `output`.
+///
+/// Keeping the temporary file on the same filesystem makes the final rename
+/// atomic and avoids cross-device moves. The `.mp4` suffix is retained because
+/// platform muxers may use it to select the output container.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
+fn unique_temp_output_path(input: &Path, output: &Path) -> Result<std::path::PathBuf, Error> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = output.file_name().ok_or_else(|| {
+        Error::NativeError(format!(
+            "output path must include a file name: {}",
+            output.display()
+        ))
+    })?;
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("video");
+
+    // Retry a few times in the unlikely event that a stale temp file already
+    // exists (or collides with the input path).
+    for _ in 0..32 {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let name = format!(
+            ".{stem}.{}.{}.{}.tmp.mp4",
+            std::process::id(),
+            nanos,
+            counter
+        );
+        let candidate = output.with_file_name(name);
+        if !candidate.exists() && !same_file(input, &candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(Error::NativeError(format!(
+        "could not allocate a temporary output path next to {}",
+        output.display()
+    )))
 }
 
 /// Read just enough of the file to run [`VideoFormat::detect`] (MPEG-TS needs
@@ -470,5 +599,46 @@ mod tests {
             H264Target::crf_fallback_bitrate_bps(1920, 1080, 30, target.crf),
             at_28
         );
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
+    #[test]
+    fn atomic_output_removes_temp_when_writer_fails() {
+        use super::write_video_atomically;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "media_compress_atomic_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("output.mp4");
+
+        let result =
+            write_video_atomically(std::path::Path::new("missing-input.mp4"), &output, |temp| {
+                std::fs::write(temp, b"partial output").unwrap();
+                Err(crate::error::Error::EncodeError("simulated".into()))
+            });
+
+        assert!(result.is_err());
+        assert!(
+            !output.exists(),
+            "failed writer must not leave an output file"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "failed writer must clean up its temporary file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

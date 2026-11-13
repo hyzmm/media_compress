@@ -273,3 +273,100 @@ fn rejects_unrecognized_container() {
         "expected UnsupportedFormat, got {err:?}"
     );
 }
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
+fn unique_test_dir(label: &str) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "media_compress_test_{label}_{}_{nanos}",
+        std::process::id()
+    ))
+}
+
+/// The file-path API must refuse `input == output` before opening either file,
+/// so the source cannot be truncated by a backend `File::create` call.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
+#[test]
+fn rejects_same_input_and_output_without_modifying_source() {
+    let dir = unique_test_dir("same_path");
+    fs::create_dir_all(&dir).expect("failed to create test dir");
+    let path = dir.join("source.mp4");
+    let original = b"source bytes that must survive".to_vec();
+    fs::write(&path, &original).expect("failed to write source");
+
+    let err = compress_video_file(&path, &path, VideoCompressOptions::default())
+        .expect_err("input == output must be rejected");
+    assert!(
+        err.to_string().contains("different files"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        fs::read(&path).expect("source was deleted"),
+        original,
+        "same-path rejection must not modify the source"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A failed re-encode must leave an existing output file untouched and clean up
+/// its temporary file. A minimal `ftyp` box passes format detection but has no
+/// decodable video track, so the platform backend fails after that point.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
+#[test]
+fn failed_compression_keeps_existing_output() {
+    let dir = unique_test_dir("keep_output");
+    fs::create_dir_all(&dir).expect("failed to create test dir");
+    let input = dir.join("input.mp4");
+    let output = dir.join("output.mp4");
+
+    let mut fake_mp4 = vec![0u8; 189];
+    fake_mp4[4..8].copy_from_slice(b"ftyp");
+    fake_mp4[8..12].copy_from_slice(b"isom");
+    fs::write(&input, &fake_mp4).expect("failed to write input");
+
+    let sentinel = b"existing output must survive".to_vec();
+    fs::write(&output, &sentinel).expect("failed to write existing output");
+
+    let err = compress_video_file(&input, &output, VideoCompressOptions::default())
+        .expect_err("fake MP4 should fail to transcode");
+    eprintln!("expected transcode failure: {err}");
+
+    assert_eq!(
+        fs::read(&output).expect("existing output was deleted"),
+        sentinel,
+        "failed compression must not modify an existing output"
+    );
+
+    let entries: Vec<_> = fs::read_dir(&dir)
+        .expect("failed to list test dir")
+        .map(|entry| entry.expect("failed to read entry").file_name())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        2,
+        "temporary output file was not cleaned up: {entries:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
