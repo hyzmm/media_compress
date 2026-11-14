@@ -12,6 +12,7 @@
 
 use media_compress::compress_image_js;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -38,6 +39,27 @@ fn detect_format(bytes: &[u8]) -> &'static str {
     } else {
         "unknown"
     }
+}
+
+/// Decode output bytes in the browser and return their intrinsic dimensions.
+/// Used to verify that the canvas path actually applies min_width/min_height.
+async fn decoded_dimensions(bytes: &[u8]) -> Result<(u32, u32), JsValue> {
+    let array = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&array)?;
+    let global = js_sys::global();
+    let create_image_bitmap =
+        js_sys::Reflect::get(&global, &JsValue::from_str("createImageBitmap"))?
+            .dyn_into::<js_sys::Function>()
+            .map_err(|_| JsValue::from_str("createImageBitmap is not available"))?;
+    let promise = create_image_bitmap
+        .call1(&global, &blob)?
+        .dyn_into::<js_sys::Promise>()?;
+    let bitmap = wasm_bindgen_futures::JsFuture::from(promise)
+        .await?
+        .dyn_into::<web_sys::ImageBitmap>()?;
+    let dimensions = (bitmap.width(), bitmap.height());
+    bitmap.close();
+    Ok(dimensions)
 }
 
 /// Compress, log stats including detected output format, return bytes.
@@ -71,6 +93,46 @@ async fn compress_jpeg_to_webp() -> Result<(), JsValue> {
 async fn compress_png_to_webp() -> Result<(), JsValue> {
     let bytes = compress_and_log("PNG  q=75", PNG_BYTES, 75.0).await?;
     assert!(is_webp(&bytes), "output is not WebP");
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+async fn min_dimensions_resize_webp_output() -> Result<(), JsValue> {
+    let (src_w, src_h) = decoded_dimensions(PNG_BYTES).await?;
+    assert!(
+        src_w > 512 && src_h > 512,
+        "fixture should be larger than 512x512, got {src_w}x{src_h}"
+    );
+
+    let out = compress_image_js(PNG_BYTES, 75.0, Some(512), Some(512))
+        .await?
+        .to_vec();
+    assert!(
+        is_webp(&out),
+        "expected WebP output (first 12 bytes: {:?})",
+        &out[..12.min(out.len())]
+    );
+
+    let (out_w, out_h) = decoded_dimensions(&out).await?;
+
+    // Same formula as compute_target_dimensions: preserve aspect ratio,
+    // shrink only, and keep the stricter of the two minimum constraints.
+    let scale = (512.0 / src_w as f64)
+        .max(512.0 / src_h as f64)
+        .clamp(0.0, 1.0);
+    let expected_w = ((src_w as f64 * scale).ceil() as u32).clamp(1, src_w);
+    let expected_h = ((src_h as f64 * scale).ceil() as u32).clamp(1, src_h);
+
+    assert_eq!(
+        (out_w, out_h),
+        (expected_w, expected_h),
+        "min_width/min_height must resize the canvas output (source {src_w}x{src_h})"
+    );
+    assert!(
+        out_w < src_w && out_h < src_h,
+        "output {out_w}x{out_h} must be smaller than source {src_w}x{src_h}"
+    );
+
     Ok(())
 }
 

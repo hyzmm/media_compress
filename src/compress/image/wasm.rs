@@ -7,7 +7,9 @@ use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Blob, ImageBitmap, ImageBitmapRenderingContext, ImageEncodeOptions, OffscreenCanvas};
+use web_sys::{
+    Blob, ImageBitmap, ImageEncodeOptions, OffscreenCanvas, OffscreenCanvasRenderingContext2d,
+};
 
 /// Decode raw image bytes with the browser-native `createImageBitmap`
 /// (JPEG, PNG, GIF, BMP, AVIF — varies by browser). For animated
@@ -46,10 +48,16 @@ async fn canvas_compress(
 
     let canvas = OffscreenCanvas::new(target_w, target_h)?;
     let ctx = canvas
-        .get_context("bitmaprenderer")?
-        .expect("bitmaprenderer context not available")
-        .dyn_into::<ImageBitmapRenderingContext>()?;
-    ctx.transfer_from_image_bitmap(&bitmap);
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("2d context not available"))?
+        .dyn_into::<OffscreenCanvasRenderingContext2d>()?;
+    ctx.draw_image_with_image_bitmap_and_dw_and_dh(
+        &bitmap,
+        0.0,
+        0.0,
+        target_w as f64,
+        target_h as f64,
+    )?;
 
     let mut webp_opts = ImageEncodeOptions::new();
     webp_opts.type_("image/webp");
