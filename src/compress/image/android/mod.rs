@@ -1,18 +1,23 @@
 mod a_image_decoder;
 mod jni_bitmap_factory;
 
+use crate::compress::image::android_fallback::{resolve_fallback, should_try_jni_fallback};
 use crate::compress::image::CompressOptions;
 use crate::error::Error;
 
 use jni::objects::JValue;
 use jni::JavaVM;
 
-/// Compress an image. Uses AImageDecoder (API 30+) when available,
-/// falls back to JNI BitmapFactory on older devices.
+/// Compress an image. Uses AImageDecoder (API 30+) when available. If it is
+/// unavailable or cannot decode the image, retry through the JNI BitmapFactory
+/// path used on older devices.
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
     match a_image_decoder::compress(input, options) {
-        Err(Error::PlatformNotSupported(_)) => jni_bitmap_factory::compress(input, options),
-        other => other,
+        Ok(output) => Ok(output),
+        Err(primary) if should_try_jni_fallback(&primary) => {
+            resolve_fallback(primary, jni_bitmap_factory::compress(input, options))
+        }
+        Err(other) => Err(other),
     }
 }
 

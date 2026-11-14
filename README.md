@@ -182,9 +182,9 @@ std::fs::write("out.mp4", out)?;
 - **动画支持**：GIF 由跨平台 zengif 链路处理（GIF→GIF，不依赖系统动画接口）；其余多帧格式输出首帧
 - **API 兼容性**：动态加载以支持低版本 Android 系统
 
-### 回退链路：JNI BitmapFactory（API < 28）
+### 回退链路：JNI BitmapFactory（API < 30 或 AImageDecoder 不可用）
 
-如果 AImageDecoder 不可用或解码失败，库会自动回退至 JNI BitmapFactory。该链路需要宿主在启动时注入 `JavaVM`，否则会出现错误：
+如果 AImageDecoder 不可用（API < 30）、返回不支持格式（`-9`）或解码失败，库会自动回退至 JNI BitmapFactory。两路都失败时，错误信息会同时包含主链路与回退链路的失败原因。该链路需要宿主在启动时注入 `JavaVM`，否则会出现错误：
 
 `Platform not supported for format: Android JNI fallback decoder unavailable: JavaVM was not initialized...`
 

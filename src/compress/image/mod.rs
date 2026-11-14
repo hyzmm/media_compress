@@ -18,6 +18,11 @@ mod orientation;
 ))]
 mod alpha;
 
+// Error/fallback policy for the Android decoders, compiled under `test` so its
+// pure decision logic runs on the host.
+#[cfg(any(target_os = "android", test))]
+mod android_fallback;
+
 // GIF decode + re-encode (zengif); used on every platform, native and wasm.
 pub(crate) mod gif;
 

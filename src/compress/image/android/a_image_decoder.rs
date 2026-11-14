@@ -2,6 +2,7 @@ use std::ffi::{c_char, c_void};
 use std::sync::OnceLock;
 
 use crate::compress::image::alpha::unpremultiply_rgba;
+use crate::compress::image::android_fallback::ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT;
 use crate::compress::image::resize;
 use crate::compress::image::webp_encode;
 use crate::compress::image::{compute_target_dimensions, CompressOptions};
@@ -27,7 +28,6 @@ struct AImageDecoderHeaderInfo {
 
 const ANDROID_BITMAP_FORMAT_RGBA_8888: i32 = 1;
 const ANDROID_IMAGE_DECODER_SUCCESS: i32 = 0;
-const ANDROID_IMAGE_DECODER_UNSUPPORTED_FORMAT: i32 = -6;
 
 // ---------------------------------------------------------------------------
 // Dynamic loading — AImageDecoder lives in libjnigraphics.so (API 30+).
