@@ -1,3 +1,4 @@
+use crate::compress::image::alpha::unpremultiply_rgba;
 use crate::compress::image::orientation::apply_exif_orientation_rgba;
 use jni::objects::{JByteArray, JObject, JValue};
 use jni::sys::{jint, jobject, JNIEnv as JNIEnvRaw};
@@ -39,7 +40,9 @@ extern "C" {
 
 pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
 
-    let (rgba, w, h) = decode_to_rgba(input)?;
+    let (mut rgba, w, h) = decode_to_rgba(input)?;
+    // BitmapFactory/Bitmap.copy return premultiplied ARGB_8888 pixels.
+    unpremultiply_rgba(&mut rgba);
     let orientation = super::orientation_from_metadata_jni(input);
     let (rgba, w, h) = apply_exif_orientation_rgba(rgba, w, h, orientation);
     let (target_w, target_h) =

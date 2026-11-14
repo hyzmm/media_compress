@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 
+use super::alpha::unpremultiply_rgba;
 use super::orientation::apply_exif_orientation_rgba;
 use super::{compute_target_dimensions, resize, CompressOptions};
 use crate::error::Error;
@@ -188,6 +189,10 @@ unsafe fn decode_frame(src: CGImageSourceRef, index: usize) -> Result<(Vec<u8>, 
     for chunk in pixels.as_chunks_mut::<4>().0 {
         chunk.swap(0, 2); // BGRA → RGBA
     }
+
+    // The bitmap context uses kCGImageAlphaPremultipliedFirst, but the WebP
+    // encoder expects straight alpha.
+    unpremultiply_rgba(&mut pixels);
 
     let orientation = get_frame_orientation(src, index);
     Ok(apply_exif_orientation_rgba(

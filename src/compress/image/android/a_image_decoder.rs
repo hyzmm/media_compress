@@ -1,6 +1,7 @@
 use std::ffi::{c_char, c_void};
 use std::sync::OnceLock;
 
+use crate::compress::image::alpha::unpremultiply_rgba;
 use crate::compress::image::resize;
 use crate::compress::image::webp_encode;
 use crate::compress::image::{compute_target_dimensions, CompressOptions};
@@ -202,7 +203,10 @@ pub fn compress(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error
         }
 
         // stride may be wider than w*4; slice to exact RGBA rows
-        let rgba = compact_rgba(&buf, w, h, stride);
+        let mut rgba = compact_rgba(&buf, w, h, stride);
+        // AImageDecoder's default alpha mode is premultiplied; WebP expects
+        // straight alpha.
+        unpremultiply_rgba(&mut rgba);
         let resized = resize::resize_rgba_nearest(&rgba, w, h, target_w, target_h);
         let result = webp_encode::encode_static(&resized, target_w, target_h, options.quality);
 

@@ -7,6 +7,17 @@ mod webp_encode;
 #[cfg(not(target_arch = "wasm32"))]
 mod orientation;
 
+// Apple and Android decoders return premultiplied RGBA; WebP expects straight
+// alpha. Windows WIC already provides straight alpha. Compiled under `test` so
+// the conversion itself also runs on non-Apple/non-Android hosts.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    test
+))]
+mod alpha;
+
 // GIF decode + re-encode (zengif); used on every platform, native and wasm.
 pub(crate) mod gif;
 

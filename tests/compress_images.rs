@@ -303,3 +303,64 @@ fn compress_all_test_images() {
         entries.len()
     );
 }
+
+/// Apple's CoreGraphics path decodes into premultiplied BGRA. The WebP encoder
+/// expects straight alpha, so a translucent color must not be encoded as its
+/// already-multiplied (darker) RGB value.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn apple_path_unpremultiplies_translucent_pixels() {
+    use std::io::Cursor;
+
+    // Left half: a known translucent color. Right half: opaque noise keeps the
+    // PNG large enough that the WebP re-encode does not fall back to the source.
+    let mut source = image::RgbaImage::new(512, 512);
+    for y in 0..512 {
+        for x in 0..512 {
+            let pixel = if x < 256 {
+                image::Rgba([128, 64, 32, 128])
+            } else {
+                let value = ((x * 37 + y * 17) % 256) as u8;
+                image::Rgba([value, 255 - value, value.wrapping_mul(3), 255])
+            };
+            source.put_pixel(x, y, pixel);
+        }
+    }
+
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(source)
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("failed to encode test PNG");
+
+    let out = compress_image(&png, CompressOptions::new(90.0)).expect("compress_image failed");
+    assert!(
+        is_webp(&out),
+        "expected WebP output, got {} bytes (source {} bytes)",
+        out.len(),
+        png.len()
+    );
+
+    let decoded = webp::Decoder::new(&out)
+        .decode()
+        .expect("failed to decode output WebP");
+    assert!(
+        decoded.is_alpha(),
+        "expected RGBA output, got {:?}",
+        decoded.layout()
+    );
+    let width = decoded.width() as usize;
+    assert_eq!((decoded.width(), decoded.height()), (512, 512));
+    let offset = (256 * width + 64) * 4;
+    let pixel = &decoded[offset..offset + 4];
+
+    // Premultiplied RGB would be around (64, 32, 16); straight alpha is
+    // (128, 64, 32). Lossy WebP may shift the values slightly.
+    assert!(
+        pixel[0] > 100 && pixel[1] > 45 && pixel[2] > 20,
+        "translucent pixel was encoded as premultiplied RGB: {pixel:?}"
+    );
+    assert!(
+        (120..=136).contains(&pixel[3]),
+        "alpha should stay near 128, got {pixel:?}"
+    );
+}
