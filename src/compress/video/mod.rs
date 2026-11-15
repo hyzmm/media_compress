@@ -11,6 +11,11 @@ mod android;
 #[cfg(target_os = "windows")]
 mod windows;
 
+// Windows Media Foundation sample-read state machine; compiled during
+// `cargo test` so its flag handling runs on the host.
+#[cfg(any(target_os = "windows", test))]
+mod windows_sample;
+
 // Pure-Rust transform helpers used by the Apple path; compiled on the Apple
 // platforms and during `cargo test` so the orientation math runs on the host.
 #[cfg(any(target_os = "macos", target_os = "ios", test))]

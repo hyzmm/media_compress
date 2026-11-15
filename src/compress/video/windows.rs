@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::rgb;
+use super::windows_sample::{classify_read_sample, ReadSampleAction};
 use super::{compute_video_target_dimensions, H264Target, VideoCompressOptions, VideoFormat};
 use crate::error::Error;
 
@@ -24,8 +25,6 @@ const MFSTARTUP_FULL: u32 = 0;
 /// MF_SOURCE_READER_FIRST_VIDEO_STREAM / _FIRST_AUDIO_STREAM.
 const MF_SOURCE_READER_FIRST_VIDEO_STREAM: u32 = 0xFFFF_FFFC;
 const MF_SOURCE_READER_FIRST_AUDIO_STREAM: u32 = 0xFFFF_FFFD;
-
-const MF_SOURCE_READERF_ENDOFSTREAM: u32 = 0x1;
 
 /// MFVideoInterlace_Progressive.
 const MF_VIDEO_INTERLACE_PROGRESSIVE: u32 = 2;
@@ -1298,40 +1297,55 @@ unsafe fn read_sample(
     reader: *mut c_void,
     stream: u32,
 ) -> Result<Option<(*mut c_void, i64)>, Error> {
-    let mut sample: *mut c_void = std::ptr::null_mut();
-    let mut actual_index: u32 = 0;
-    let mut flags: u32 = 0;
-    let mut ts: i64 = 0;
-    let hr = com_call!(
-        reader,
-        9,
-        unsafe extern "system" fn(
-            *mut c_void,
-            u32,
-            u32,
-            *mut u32,
-            *mut u32,
-            *mut i64,
-            *mut *mut c_void,
-        ) -> HRESULT,
-        stream,
-        0u32,
-        &mut actual_index,
-        &mut flags,
-        &mut ts,
-        &mut sample
-    );
-    if !hres_ok(hr) {
-        return Err(err_decode("ReadSample", hr));
-    }
-    if sample.is_null() || (flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0 {
-        if !sample.is_null() {
-            release_com(sample);
+    loop {
+        let mut sample: *mut c_void = std::ptr::null_mut();
+        let mut actual_index: u32 = 0;
+        let mut flags: u32 = 0;
+        let mut ts: i64 = 0;
+        let hr = com_call!(
+            reader,
+            9,
+            unsafe extern "system" fn(
+                *mut c_void,
+                u32,
+                u32,
+                *mut u32,
+                *mut u32,
+                *mut i64,
+                *mut *mut c_void,
+            ) -> HRESULT,
+            stream,
+            0u32,
+            &mut actual_index,
+            &mut flags,
+            &mut ts,
+            &mut sample
+        );
+        if !hres_ok(hr) {
+            return Err(err_decode("ReadSample", hr));
         }
-        return Ok(None);
+        let _ = actual_index;
+
+        match classify_read_sample(!sample.is_null(), flags) {
+            ReadSampleAction::UseSample => return Ok(Some((sample, ts))),
+            ReadSampleAction::EndOfStream => return Ok(None),
+            ReadSampleAction::Retry => {
+                // A null sample without EOS is a stream event (tick, media type
+                // change, etc.). Try again instead of truncating the output.
+                if !sample.is_null() {
+                    release_com(sample);
+                }
+            }
+            ReadSampleAction::Fail => {
+                if !sample.is_null() {
+                    release_com(sample);
+                }
+                return Err(Error::DecodeError(format!(
+                    "ReadSample reported MF_SOURCE_READERF_ERROR (flags: 0x{flags:08x})"
+                )));
+            }
+        }
     }
-    let _ = (actual_index, flags);
-    Ok(Some((sample, ts)))
 }
 
 /// Convert one decoded frame to packed BGRA at the target size and write it.
