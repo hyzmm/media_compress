@@ -222,6 +222,30 @@ unsafe fn release_com(p: *mut c_void) {
     }
 }
 
+/// Owned Media Foundation sample.
+///
+/// `IMFSample` is a reference-counted COM object. Holding it in this guard
+/// means an early return in the pump loop releases every sample that was
+/// already pulled from the source reader, instead of leaking it when a later
+/// write fails.
+struct OwnedSample(*mut c_void);
+
+impl OwnedSample {
+    fn new(sample: *mut c_void) -> Option<Self> {
+        (!sample.is_null()).then_some(Self(sample))
+    }
+
+    fn as_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
+
+impl Drop for OwnedSample {
+    fn drop(&mut self) {
+        unsafe { release_com(self.0) };
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FFI — Media Foundation free functions
 // ---------------------------------------------------------------------------
@@ -824,7 +848,7 @@ struct SourceSetup {
     rotation: u32,
     /// First decoded video sample, read up front to sniff the real buffer
     /// geometry.
-    first_video: Option<(*mut c_void, i64)>,
+    first_video: Option<(OwnedSample, i64)>,
 }
 
 unsafe fn set_current_media_type(
@@ -1005,13 +1029,7 @@ unsafe fn configure_source(
     let Some((sample, ts)) = read_sample(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM)? else {
         return Err(err_decode("video stream has no samples", -1));
     };
-    let len = match sample_contiguous_len(sample) {
-        Ok(len) => len,
-        Err(e) => {
-            release_com(sample);
-            return Err(e);
-        }
-    };
+    let len = sample_contiguous_len(sample.as_ptr())?;
     let layout = match detect_layout(len as usize, src_w as usize, src_h as usize) {
         Some(layout) => layout,
         // The Video Processor is asked for packed RGB32 at the source size;
@@ -1021,7 +1039,6 @@ unsafe fn configure_source(
             stride: src_w as usize * 4,
         },
         None => {
-            release_com(sample);
             return Err(err_decode("unexpected decoder buffer layout", -1));
         }
     };
@@ -1235,8 +1252,8 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
     }
 
     // ── Pump samples (timestamp-interleaved) ─────────────────────────────
-    let mut video_pending: Option<(*mut c_void, i64)> = first_video;
-    let mut audio_pending: Option<(*mut c_void, i64)> = None;
+    let mut video_pending: Option<(OwnedSample, i64)> = first_video;
+    let mut audio_pending: Option<(OwnedSample, i64)> = None;
     let mut video_done = false;
     let mut audio_done = !has_audio;
 
@@ -1268,10 +1285,10 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
 
             if write_video {
                 let (sample, ts) = video_pending.take().unwrap();
-                let r = write_video_sample(
+                write_video_sample(
                     writer,
                     video_stream,
-                    sample,
+                    sample.as_ptr(),
                     ts,
                     src_w as usize,
                     src_h as usize,
@@ -1282,9 +1299,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
                     layout,
                     matrix,
                     full_range,
-                );
-                release_com(sample);
-                r?;
+                )?;
             } else {
                 let (sample, _ts) = audio_pending.take().unwrap();
                 let hr = com_call!(
@@ -1292,9 +1307,8 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
                     6,
                     unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> HRESULT,
                     audio_stream,
-                    sample
+                    sample.as_ptr()
                 );
-                release_com(sample);
                 if !hres_ok(hr) {
                     return Err(err_encode("WriteSample (audio)", hr));
                 }
@@ -1328,7 +1342,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
 unsafe fn read_sample(
     reader: *mut c_void,
     stream: u32,
-) -> Result<Option<(*mut c_void, i64)>, Error> {
+) -> Result<Option<(OwnedSample, i64)>, Error> {
     loop {
         let mut sample: *mut c_void = std::ptr::null_mut();
         let mut actual_index: u32 = 0;
@@ -1354,24 +1368,26 @@ unsafe fn read_sample(
             &mut sample
         );
         if !hres_ok(hr) {
+            drop(OwnedSample::new(sample));
             return Err(err_decode("ReadSample", hr));
         }
         let _ = actual_index;
 
         match classify_read_sample(!sample.is_null(), flags) {
-            ReadSampleAction::UseSample => return Ok(Some((sample, ts))),
+            ReadSampleAction::UseSample => {
+                let sample = OwnedSample::new(sample).ok_or_else(|| {
+                    Error::DecodeError("ReadSample reported a sample but returned null".into())
+                })?;
+                return Ok(Some((sample, ts)));
+            }
             ReadSampleAction::EndOfStream => return Ok(None),
             ReadSampleAction::Retry => {
                 // A null sample without EOS is a stream event (tick, media type
                 // change, etc.). Try again instead of truncating the output.
-                if !sample.is_null() {
-                    release_com(sample);
-                }
+                drop(OwnedSample::new(sample));
             }
             ReadSampleAction::Fail => {
-                if !sample.is_null() {
-                    release_com(sample);
-                }
+                drop(OwnedSample::new(sample));
                 return Err(Error::DecodeError(format!(
                     "ReadSample reported MF_SOURCE_READERF_ERROR (flags: 0x{flags:08x})"
                 )));
