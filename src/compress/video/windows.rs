@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::rgb;
@@ -228,7 +229,6 @@ unsafe fn release_com(p: *mut c_void) {
 #[link(name = "mfplat")]
 extern "system" {
     fn MFStartup(version: u32, flags: u32) -> HRESULT;
-    fn MFShutdown() -> HRESULT;
     fn MFCreateAttributes(pp_attributes: *mut *mut c_void, initial_size: u32) -> HRESULT;
     fn MFCreateMediaType(pp_mt: *mut *mut c_void) -> HRESULT;
     fn MFCreateMemoryBuffer(max_length: u32, pp_buffer: *mut *mut c_void) -> HRESULT;
@@ -1086,21 +1086,30 @@ pub fn compress_file(
 // Transcode implementation
 // ---------------------------------------------------------------------------
 
+/// Initialise Media Foundation once for the whole process.
+///
+/// `MFStartup` / `MFShutdown` are process-wide, and Microsoft recommends
+/// pairing them during application startup and teardown rather than around
+/// each operation. Calling `MFShutdown` when one transcode finishes would tear
+/// the platform down under any concurrent transcode, so start it lazily on
+/// first use and keep it initialised for the process lifetime.
+fn ensure_media_foundation() -> Result<(), Error> {
+    static STARTUP: OnceLock<HRESULT> = OnceLock::new();
+    let hr = *STARTUP.get_or_init(|| unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) });
+    if hres_ok(hr) {
+        Ok(())
+    } else {
+        Err(err_encode("MFStartup", hr))
+    }
+}
+
 fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Result<(), Error> {
+    ensure_media_foundation()?;
+
     let in_url = wide_path(in_path);
     let out_url = wide_path(out_path);
 
-    unsafe {
-        let hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-        if !hres_ok(hr) {
-            return Err(err_encode("MFStartup", hr));
-        }
-
-        let result = transcode_impl(&in_url, &out_url, target);
-
-        MFShutdown();
-        result
-    }
+    unsafe { transcode_impl(&in_url, &out_url, target) }
 }
 
 unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) -> Result<(), Error> {

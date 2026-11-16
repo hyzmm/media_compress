@@ -370,3 +370,38 @@ fn failed_compression_keeps_existing_output() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Media Foundation is process-wide. Concurrent compressions must not shut the
+/// platform down under each other, which happened when every transcode paired
+/// its own `MFStartup` / `MFShutdown` call.
+#[cfg(target_os = "windows")]
+#[test]
+fn concurrent_file_compression_keeps_media_foundation_alive() {
+    let input = input_dir().join("small_360p.mp4");
+    if !input.exists() {
+        eprintln!("small_360p.mp4 does not exist — skipping test");
+        return;
+    }
+
+    let dir = unique_test_dir("concurrent");
+    fs::create_dir_all(&dir).expect("failed to create test dir");
+
+    let mut handles = Vec::new();
+    for index in 0..2 {
+        let input = input.clone();
+        let output = dir.join(format!("out_{index}.mp4"));
+        handles.push(std::thread::spawn(move || {
+            let result = compress_video_file(&input, &output, VideoCompressOptions::new(30.0));
+            (output, result)
+        }));
+    }
+
+    for handle in handles {
+        let (output, result) = handle.join().expect("compression thread panicked");
+        result.expect("concurrent compression failed");
+        let bytes = fs::read(&output).expect("output was not written");
+        assert!(is_mp4(&bytes), "output is not an MP4: {}", output.display());
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
