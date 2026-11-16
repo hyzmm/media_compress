@@ -180,6 +180,14 @@ const MF_MT_VIDEO_NOMINAL_RANGE: GUID = GUID {
     data3: 0x4071,
     data4: [0x8d, 0xaf, 0x32, 0x5e, 0xdf, 0x5c, 0xab, 0x11],
 };
+/// MF_MT_VIDEO_ROTATION: counter-clockwise rotation recorded by the container
+/// (0 / 90 / 180 / 270 degrees).
+const MF_MT_VIDEO_ROTATION: GUID = GUID {
+    data1: 0xc380_465d,
+    data2: 0x2271,
+    data3: 0x428c,
+    data4: [0x9b, 0x83, 0xec, 0xea, 0x3b, 0x4a, 0x85, 0xc1],
+};
 
 // MFVideoTransferMatrix_* (mfobjects.h).
 const MF_VIDEO_TRANSFER_MATRIX_BT601: u32 = 2;
@@ -811,6 +819,9 @@ struct SourceSetup {
     layout: DecodedLayout,
     matrix: rgb::YuvMatrix,
     full_range: bool,
+    /// Counter-clockwise rotation from `MF_MT_VIDEO_ROTATION`, normalized to
+    /// 0 / 90 / 180 / 270 degrees.
+    rotation: u32,
     /// First decoded video sample, read up front to sniff the real buffer
     /// geometry.
     first_video: Option<(*mut c_void, i64)>,
@@ -923,6 +934,11 @@ unsafe fn configure_source(
     let yuv_matrix = attr_get_u32(native, &MF_MT_YUV_MATRIX).ok();
     let full_range =
         attr_get_u32(native, &MF_MT_VIDEO_NOMINAL_RANGE).ok() == Some(MF_NOMINAL_RANGE_0_255);
+    // The source reader hands back unrotated decoder frames. The container's
+    // rotation is applied on the CPU before scaling.
+    let rotation = attr_get_u32(native, &MF_MT_VIDEO_ROTATION)
+        .map(rgb::normalize_rotation)
+        .unwrap_or(0);
     release_com(native);
 
     let (src_w, src_h) = size.map_err(|hr| err_decode("GetUINT64 (MF_MT_FRAME_SIZE)", hr))?;
@@ -1021,6 +1037,7 @@ unsafe fn configure_source(
         layout,
         matrix,
         full_range,
+        rotation,
         first_video,
     })
 }
@@ -1107,10 +1124,15 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
         layout,
         matrix,
         full_range,
+        rotation,
         first_video,
     } = setup;
 
-    let (target_w, target_h) = compute_video_target_dimensions(src_w, src_h);
+    // Encoder dimensions follow the displayed orientation; the decoded buffer
+    // keeps the coded dimensions until the frame is rotated in
+    // `write_video_sample`.
+    let (display_w, display_h) = rgb::rotated_dimensions(src_w as usize, src_h as usize, rotation);
+    let (target_w, target_h) = compute_video_target_dimensions(display_w as u32, display_h as u32);
     let fps = (fps_num as u64 + fps_den as u64 - 1) / fps_den as u64; // ceil
     let fps = fps.clamp(1, u32::MAX as u64) as u32;
     // Media Foundation's sink writer only exposes average-bitrate control, so
@@ -1244,6 +1266,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
                     ts,
                     src_w as usize,
                     src_h as usize,
+                    rotation,
                     target_w as usize,
                     target_h as usize,
                     fps as i64,
@@ -1348,7 +1371,8 @@ unsafe fn read_sample(
     }
 }
 
-/// Convert one decoded frame to packed BGRA at the target size and write it.
+/// Convert one decoded frame to packed BGRA, apply the container rotation,
+/// scale it to the target size and write it.
 unsafe fn write_video_sample(
     writer: *mut c_void,
     stream: u32,
@@ -1356,6 +1380,7 @@ unsafe fn write_video_sample(
     ts: i64,
     src_w: usize,
     src_h: usize,
+    rotation: u32,
     target_w: usize,
     target_h: usize,
     fps: i64,
@@ -1460,12 +1485,27 @@ unsafe fn write_video_sample(
         return Err(err_decode("frame conversion produced empty buffer", -1));
     }
 
+    // Decoder buffers are unrotated even when the container records
+    // MF_MT_VIDEO_ROTATION. Rotate first so the scaler works on the displayed
+    // orientation (90/270 degree rotation swaps width and height).
+    let rotated: Vec<u8>;
+    let frame: &[u8] = if rotation == 0 {
+        &bgra
+    } else {
+        rotated = rgb::rotate_bgra_ccw(&bgra, src_w, src_h, rotation);
+        &rotated
+    };
+    if frame.is_empty() {
+        return Err(err_decode("frame rotation produced empty buffer", -1));
+    }
+    let (display_w, display_h) = rgb::rotated_dimensions(src_w, src_h, rotation);
+
     let scaled: Vec<u8>;
-    let frame: &[u8] = if target_w != src_w || target_h != src_h {
-        scaled = rgb::scale_bgra(&bgra, src_w, src_h, target_w, target_h);
+    let frame: &[u8] = if target_w != display_w || target_h != display_h {
+        scaled = rgb::scale_bgra(frame, display_w, display_h, target_w, target_h);
         &scaled
     } else {
-        &bgra
+        frame
     };
 
     if frame.is_empty() {

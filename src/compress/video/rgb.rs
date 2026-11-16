@@ -126,6 +126,53 @@ pub fn scale_bgra(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: u
     out
 }
 
+/// Normalize `MF_MT_VIDEO_ROTATION` (counter-clockwise degrees) to one of
+/// `0`, `90`, `180` or `270`. Unknown angles are treated as no rotation so a
+/// malformed container cannot flip the picture.
+pub fn normalize_rotation(degrees: u32) -> u32 {
+    match degrees % 360 {
+        90 => 90,
+        180 => 180,
+        270 => 270,
+        _ => 0,
+    }
+}
+
+/// Dimensions of a `w` x `h` frame after a counter-clockwise rotation.
+pub fn rotated_dimensions(w: usize, h: usize, degrees: u32) -> (usize, usize) {
+    match degrees % 360 {
+        90 | 270 => (h, w),
+        _ => (w, h),
+    }
+}
+
+/// Rotate a tightly packed BGRA32 frame counter-clockwise by `degrees`.
+///
+/// `degrees` must be a multiple of 90; other angles, empty frames and buffers
+/// shorter than `w * h * 4` return an empty buffer.
+pub fn rotate_bgra_ccw(src: &[u8], w: usize, h: usize, degrees: u32) -> Vec<u8> {
+    if w == 0 || h == 0 || degrees % 90 != 0 || src.len() < w * h * 4 {
+        return Vec::new();
+    }
+    let turns = (degrees % 360) / 90;
+    let (dst_w, dst_h) = rotated_dimensions(w, h, degrees);
+    let mut out = vec![0u8; dst_w * dst_h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = match turns {
+                0 => (x, y),
+                1 => (y, w - 1 - x),
+                2 => (w - 1 - x, h - 1 - y),
+                _ => (h - 1 - y, x),
+            };
+            let src_at = (y * w + x) * 4;
+            let dst_at = (dy * dst_w + dx) * 4;
+            out[dst_at..dst_at + 4].copy_from_slice(&src[src_at..src_at + 4]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +286,56 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         assert!(pack_bgra_rows(&src, 2, 2, 6).is_empty());
+    }
+
+    fn marker_frame() -> Vec<u8> {
+        // 3x2 BGRA frame whose red byte identifies each pixel:
+        //   1 2 3
+        //   4 5 6
+        let mut src = Vec::new();
+        for marker in 1u8..=6 {
+            src.extend_from_slice(&[0, 0, marker, 255]);
+        }
+        src
+    }
+
+    fn markers(frame: &[u8]) -> Vec<u8> {
+        frame.as_chunks::<4>().0.iter().map(|px| px[2]).collect()
+    }
+
+    #[test]
+    fn rotate_bgra_90_ccw_maps_corners() {
+        let out = rotate_bgra_ccw(&marker_frame(), 3, 2, 90);
+        assert_eq!(out.len(), 2 * 3 * 4);
+        assert_eq!(markers(&out), [3, 6, 2, 5, 1, 4]);
+    }
+
+    #[test]
+    fn rotate_bgra_180_and_270_ccw() {
+        let out = rotate_bgra_ccw(&marker_frame(), 3, 2, 180);
+        assert_eq!(markers(&out), [6, 5, 4, 3, 2, 1]);
+
+        let out = rotate_bgra_ccw(&marker_frame(), 3, 2, 270);
+        assert_eq!(markers(&out), [4, 1, 5, 2, 6, 3]);
+    }
+
+    #[test]
+    fn rotate_bgra_rejects_bad_angles_and_short_buffers() {
+        assert!(rotate_bgra_ccw(&marker_frame(), 3, 2, 45).is_empty());
+        assert!(rotate_bgra_ccw(&[0u8; 8], 3, 2, 90).is_empty());
+        assert!(rotate_bgra_ccw(&[], 0, 2, 90).is_empty());
+    }
+
+    #[test]
+    fn rotation_metadata_is_normalized() {
+        assert_eq!(normalize_rotation(0), 0);
+        assert_eq!(normalize_rotation(90), 90);
+        assert_eq!(normalize_rotation(180), 180);
+        assert_eq!(normalize_rotation(270), 270);
+        assert_eq!(normalize_rotation(360), 0);
+        assert_eq!(normalize_rotation(45), 0);
+        assert_eq!(rotated_dimensions(1920, 1080, 90), (1080, 1920));
+        assert_eq!(rotated_dimensions(1920, 1080, 270), (1080, 1920));
+        assert_eq!(rotated_dimensions(1920, 1080, 180), (1920, 1080));
     }
 }
