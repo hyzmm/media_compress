@@ -262,7 +262,7 @@ fn cmtime_numeric_zero() -> CMTime {
     }
 }
 
-unsafe fn asset_duration(asset: Id) -> CMTime {
+unsafe fn cmtime_property(object: Id, selector: Sel) -> CMTime {
     #[cfg(target_arch = "x86_64")]
     {
         let mut t = CMTime {
@@ -271,13 +271,29 @@ unsafe fn asset_duration(asset: Id) -> CMTime {
             flags: 0,
             epoch: 0,
         };
-        msg_stret_cmtime(&mut t, asset, sel(c"duration"));
+        msg_stret_cmtime(&mut t, object, selector);
         t
     }
     #[cfg(target_arch = "aarch64")]
     {
-        msg_cmtime(asset, sel(c"duration"))
+        msg_cmtime(object, selector)
     }
+}
+
+/// A frame duration is usable when it is valid and represents a plausible
+/// video cadence. `minFrameDuration` can be tiny on variable-frame-rate screen
+/// recordings (a few high-speed frames), and feeding that straight into the
+/// composition would render at an absurd rate, so clamp the accepted range.
+fn usable_frame_duration(t: CMTime) -> bool {
+    if t.flags & K_CMTIME_FLAGS_VALID == 0 || t.value <= 0 || t.timescale <= 0 {
+        return false;
+    }
+    let fps = t.timescale as f64 / t.value as f64;
+    (1.0..=240.0).contains(&fps)
+}
+
+unsafe fn asset_duration(asset: Id) -> CMTime {
+    cmtime_property(asset, sel(c"duration"))
 }
 
 /// The track's display orientation/scale relative to its encoded pixels.
@@ -462,23 +478,27 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
             ));
         }
 
-        // Frame duration from the track's nominal frame rate (default 30fps).
-        let fps = msg_float(video_track, sel(c"nominalFrameRate"));
-        let timescale = if fps.is_finite() && fps > 1.0 {
-            fps.round() as i32
+        // Keep the track's exact frame duration. `nominalFrameRate` is a float,
+        // and rounding it to an integer turns 23.976 / 29.97 / 59.94 sources
+        // into 24 / 30 / 60 fps. The composition would then render at the
+        // wrong cadence, making the video stream drift away from the audio.
+        let min_frame_duration = cmtime_property(video_track, sel(c"minFrameDuration"));
+        let frame_duration = if usable_frame_duration(min_frame_duration) {
+            min_frame_duration
         } else {
-            30
-        };
-        msg_set_cmtime(
-            comp,
-            sel(c"setFrameDuration:"),
+            let fps = msg_float(video_track, sel(c"nominalFrameRate"));
             CMTime {
                 value: 1,
-                timescale,
+                timescale: if fps.is_finite() && fps > 1.0 {
+                    fps.round() as i32
+                } else {
+                    30
+                },
                 flags: K_CMTIME_FLAGS_VALID,
                 epoch: 0,
-            },
-        );
+            }
+        };
+        msg_set_cmtime(comp, sel(c"setFrameDuration:"), frame_duration);
         msg_set_size(
             comp,
             sel(c"setRenderSize:"),
@@ -769,4 +789,48 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
     CFRelease(in_url);
     CFRelease(out_url);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{usable_frame_duration, CMTime, K_CMTIME_FLAGS_VALID};
+
+    fn cmtime(value: i64, timescale: i32, flags: u32) -> CMTime {
+        CMTime {
+            value,
+            timescale,
+            flags,
+            epoch: 0,
+        }
+    }
+
+    #[test]
+    fn accepts_exact_ntsc_frame_durations() {
+        for (value, timescale) in [
+            (1001, 24_000),
+            (1001, 30_000),
+            (1001, 60_000),
+            (1, 25),
+            (1, 30),
+        ] {
+            assert!(
+                usable_frame_duration(cmtime(value, timescale, K_CMTIME_FLAGS_VALID)),
+                "{timescale}/{value} should be a usable frame duration"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_implausible_frame_durations() {
+        assert!(!usable_frame_duration(cmtime(1, 30, 0)));
+        assert!(!usable_frame_duration(cmtime(0, 30, K_CMTIME_FLAGS_VALID)));
+        assert!(!usable_frame_duration(cmtime(1, 0, K_CMTIME_FLAGS_VALID)));
+        assert!(!usable_frame_duration(cmtime(-1, 30, K_CMTIME_FLAGS_VALID)));
+        // A VFR track's minimum can be far above any sensible render rate.
+        assert!(!usable_frame_duration(cmtime(
+            1,
+            1000,
+            K_CMTIME_FLAGS_VALID
+        )));
+    }
 }

@@ -16,6 +16,11 @@ mod windows;
 #[cfg(any(target_os = "windows", test))]
 mod windows_sample;
 
+// Rational frame-rate helpers used by the Windows path; compiled during
+// `cargo test` so the exact 1001-denominator durations run on the host.
+#[cfg(any(target_os = "windows", test))]
+mod frame_rate;
+
 // Pure-Rust transform helpers used by the Apple path; compiled on the Apple
 // platforms and during `cargo test` so the orientation math runs on the host.
 #[cfg(any(target_os = "macos", target_os = "ios", test))]

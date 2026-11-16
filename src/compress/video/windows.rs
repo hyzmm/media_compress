@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::frame_rate::{ceil_fps, frame_duration_100ns};
 use super::rgb;
 use super::windows_sample::{classify_read_sample, ReadSampleAction};
 use super::{compute_video_target_dimensions, H264Target, VideoCompressOptions, VideoFormat};
@@ -36,9 +37,6 @@ const AUDIO_BITS_PER_SAMPLE: u32 = 16;
 const AUDIO_BLOCK_ALIGNMENT: u32 = 4; // channels * bits_per_sample / 8
 const AUDIO_BITRATE_BPS: u32 = 128_000;
 const DEFAULT_FRAME_RATE: u32 = 30;
-
-// 100-nanosecond units per second.
-const HNS_PER_SECOND: i64 = 10_000_000;
 
 // ---------------------------------------------------------------------------
 // GUID
@@ -574,7 +572,8 @@ unsafe fn h264_output_type(
     w: u32,
     h: u32,
     bitrate_bps: u32,
-    fps: u32,
+    fps_num: u32,
+    fps_den: u32,
 ) -> Result<*mut c_void, Error> {
     let mt = new_media_type()?;
     let r = (|| {
@@ -590,7 +589,7 @@ unsafe fn h264_output_type(
         if !hres_ok(attr_set_u32(mt, &MF_MT_AVG_BITRATE, bitrate_bps)) {
             return Err(err_encode("set MF_MT_AVG_BITRATE", -1));
         }
-        if !hres_ok(attr_set_ratio(mt, &MF_MT_FRAME_RATE, fps, 1)) {
+        if !hres_ok(attr_set_ratio(mt, &MF_MT_FRAME_RATE, fps_num, fps_den)) {
             return Err(err_encode("set MF_MT_FRAME_RATE", -1));
         }
         if !hres_ok(attr_set_ratio(mt, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)) {
@@ -615,7 +614,12 @@ unsafe fn h264_output_type(
 }
 
 /// Sink writer input type: RGB32 at target dimensions.
-unsafe fn rgb32_input_type(w: u32, h: u32, fps: u32) -> Result<*mut c_void, Error> {
+unsafe fn rgb32_input_type(
+    w: u32,
+    h: u32,
+    fps_num: u32,
+    fps_den: u32,
+) -> Result<*mut c_void, Error> {
     let mt = new_media_type()?;
     let r = (|| {
         if !hres_ok(attr_set_guid(mt, &MF_MT_MAJOR_TYPE, &MF_MEDIA_TYPE_VIDEO)) {
@@ -627,7 +631,7 @@ unsafe fn rgb32_input_type(w: u32, h: u32, fps: u32) -> Result<*mut c_void, Erro
         if !hres_ok(attr_set_size(mt, &MF_MT_FRAME_SIZE, w, h)) {
             return Err(err_encode("set MF_MT_FRAME_SIZE", -1));
         }
-        if !hres_ok(attr_set_ratio(mt, &MF_MT_FRAME_RATE, fps, 1)) {
+        if !hres_ok(attr_set_ratio(mt, &MF_MT_FRAME_RATE, fps_num, fps_den)) {
             return Err(err_encode("set MF_MT_FRAME_RATE", -1));
         }
         if !hres_ok(attr_set_ratio(mt, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)) {
@@ -1159,11 +1163,11 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
     // `write_video_sample`.
     let (display_w, display_h) = rgb::rotated_dimensions(src_w as usize, src_h as usize, rotation);
     let (target_w, target_h) = compute_video_target_dimensions(display_w as u32, display_h as u32);
-    let fps = (fps_num as u64 + fps_den as u64 - 1) / fps_den as u64; // ceil
-    let fps = fps.clamp(1, u32::MAX as u64) as u32;
+    let fps_for_bitrate = ceil_fps(fps_num, fps_den);
     // Media Foundation's sink writer only exposes average-bitrate control, so
     // the CRF target is converted to an equivalent VBR bitrate here.
-    let bitrate_bps = H264Target::crf_fallback_bitrate_bps(target_w, target_h, fps, target.crf);
+    let bitrate_bps =
+        H264Target::crf_fallback_bitrate_bps(target_w, target_h, fps_for_bitrate, target.crf);
 
     // ── Sink writer ──────────────────────────────────────────────────────
     let mut writer: *mut c_void = std::ptr::null_mut();
@@ -1178,7 +1182,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
         return Err(err_encode("MFCreateSinkWriterFromURL", hr));
     }
 
-    let video_output_type = h264_output_type(target_w, target_h, bitrate_bps, fps)?;
+    let video_output_type = h264_output_type(target_w, target_h, bitrate_bps, fps_num, fps_den)?;
     let mut video_stream: u32 = 0;
     let hr = com_call!(
         writer,
@@ -1194,7 +1198,7 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
         return Err(err_encode("AddStream (video)", hr));
     }
 
-    let video_input_type = rgb32_input_type(target_w, target_h, fps)?;
+    let video_input_type = rgb32_input_type(target_w, target_h, fps_num, fps_den)?;
     let hr = com_call!(
         writer,
         4,
@@ -1295,7 +1299,8 @@ unsafe fn transcode_impl(in_url: &[u16], out_url: &[u16], target: H264Target) ->
                     rotation,
                     target_w as usize,
                     target_h as usize,
-                    fps as i64,
+                    fps_num,
+                    fps_den,
                     layout,
                     matrix,
                     full_range,
@@ -1408,7 +1413,8 @@ unsafe fn write_video_sample(
     rotation: u32,
     target_w: usize,
     target_h: usize,
-    fps: i64,
+    fps_num: u32,
+    fps_den: u32,
     layout: DecodedLayout,
     matrix: rgb::YuvMatrix,
     full_range: bool,
@@ -1425,7 +1431,7 @@ unsafe fn write_video_sample(
         &mut duration
     );
     if duration <= 0 {
-        duration = HNS_PER_SECOND / fps.max(1);
+        duration = frame_duration_100ns(fps_num, fps_den);
     }
 
     let mut buffer: *mut c_void = std::ptr::null_mut();
