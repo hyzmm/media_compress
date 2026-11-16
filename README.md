@@ -153,7 +153,7 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 ## 视频压缩（macOS / iOS / Android / Windows）
 
 - macOS / iOS：通过 AVFoundation（AVAssetReader/AVAssetWriter）转码。
-- Android：通过 NDK 原生 MediaCodec + MediaMuxer（libmediandk）转码，无需调用方注入 `JavaVM`。
+- Android：通过 NDK 原生 MediaCodec + MediaMuxer（libmediandk）转码，无需调用方注入 `JavaVM`。解码帧的平面布局以 MediaCodec 输出格式为准：优先读取 `image-data`（`MediaImage2` / 旧版 `MediaImage`）中的 Y/U/V 偏移与步长，因此 `COLOR_FormatYUV420Flexible` 和厂商格式不会被固定当成 NV12；没有该描述符时只接受标准 I420/NV12/NV21，其他布局直接报错，不再静默输出黑帧。
 - Windows：通过 Media Foundation（IMFSourceReader / IMFSinkWriter）转码。优先读取解码器的原生 NV12 输出并在 CPU 转为 RGBA——按实际缓冲长度推导 stride 与 coded 高度（解码器可能输出比显示尺寸更大的缓冲，直接按显示 stride 读取会造成逐行错位），再裁切到显示尺寸；无法识别的格式回退到 Video Processor 的 RGB32。随后编码为 H.264，音频重编码为 AAC。读取循环只在 `MF_SOURCE_READERF_ENDOFSTREAM` 时结束：流 tick、媒体类型变化等空样本会继续读取，EOS 同时带样本时先写入该样本。
 
 统一输出 H.264 + MP4，音频重编码为 AAC。视频按 x264 风格 CRF 压缩（0–51，越小画质越高、体积越大）。输出默认保持源视频宽高；当编码器拒绝源尺寸时（例如高分屏录屏 1344×2992 超出部分 H.264 编码器的最大高度），会先尝试 `max_width`/`max_height`（未设置时用 1920/1280/720 档）等比缩小到编码器可接受的尺寸（当前由 Android 后端实现），保证转码能完成。即使转码结果比原文件大（例如高码率 HEVC 源转 H.264），也保留转码结果，不回退原文件。

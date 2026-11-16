@@ -51,6 +51,12 @@ extern "C" {
     fn AMediaFormat_delete(fmt: *mut AMediaFormat) -> i32;
     fn AMediaFormat_getInt32(fmt: *mut AMediaFormat, name: *const c_char, out: *mut i32) -> u8;
     fn AMediaFormat_getFloat(fmt: *mut AMediaFormat, name: *const c_char, out: *mut f32) -> u8;
+    fn AMediaFormat_getBuffer(
+        fmt: *mut AMediaFormat,
+        name: *const c_char,
+        data: *mut *mut c_void,
+        size: *mut usize,
+    ) -> u8;
     fn AMediaFormat_getString(
         fmt: *mut AMediaFormat,
         name: *const c_char,
@@ -280,6 +286,22 @@ unsafe fn format_string(fmt: *mut AMediaFormat, key: &'static CStr) -> Option<St
         .then(|| CStr::from_ptr(out).to_string_lossy().into_owned())
 }
 
+/// Exact YUV plane layout from the decoder's `image-data` descriptor.
+///
+/// MediaCodec only attaches this for raw video output formats. It is the only
+/// way to resolve `COLOR_FormatYUV420Flexible` (and vendor formats) through the
+/// NDK, which has no `AMediaCodec_getOutputImage`.
+unsafe fn format_planes(fmt: *mut AMediaFormat) -> Option<yuv::PlaneLayout> {
+    let mut data: *mut c_void = std::ptr::null_mut();
+    let mut size = 0usize;
+    let present = AMediaFormat_getBuffer(fmt, c"image-data".as_ptr(), &mut data, &mut size) != 0;
+    if !present || data.is_null() || size == 0 {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(data.cast::<u8>(), size);
+    yuv::parse_image_data(bytes)
+}
+
 /// Visible region of a codec frame; falls back to the full size when the
 /// format has no (valid) crop keys.
 unsafe fn crop_rect(fmt: *mut AMediaFormat, width: usize, height: usize) -> CropRect {
@@ -495,6 +517,10 @@ struct VideoLayout {
     stride: usize,
     slice_height: usize,
     color_format: i32,
+    /// Authoritative plane addressing when the codec publishes `image-data`.
+    /// Needed for flexible/vendor formats whose layout the color format does
+    /// not describe.
+    planes: Option<yuv::PlaneLayout>,
 }
 
 impl VideoLayout {
@@ -505,6 +531,7 @@ impl VideoLayout {
             stride: crop.width,
             slice_height: crop.height,
             color_format: yuv::COLOR_FORMAT_YUV420_PLANAR,
+            planes: None,
         }
     }
 
@@ -542,11 +569,14 @@ impl VideoLayout {
             .filter(|v| *v >= height)
             .unwrap_or(height);
 
+        let color_format = format_i32(fmt, c"color-format").unwrap_or(fallback.color_format);
+        let planes = format_planes(fmt);
         Some(Self {
             crop,
             stride,
             slice_height,
-            color_format: format_i32(fmt, c"color-format").unwrap_or(fallback.color_format),
+            color_format,
+            planes,
         })
     }
 }
@@ -1529,19 +1559,24 @@ fn prepare_frame(
     encoder_color_format: i32,
 ) -> Result<Vec<u8>, Error> {
     let crop = layout.crop.even();
-    let i420 = yuv::to_i420(
-        raw,
-        layout.stride,
-        layout.slice_height,
-        layout.color_format,
-        crop,
-    );
-    if i420.is_empty() {
-        return Err(Error::DecodeError(format!(
-            "decoder output does not fit layout {:?} stride {} slice-height {} ({} bytes)",
-            crop,
+    let i420 = match layout.planes {
+        Some(planes) => yuv::to_i420_with_planes(raw, &planes, crop),
+        None => yuv::to_i420(
+            raw,
             layout.stride,
             layout.slice_height,
+            layout.color_format,
+            crop,
+        ),
+    };
+    if i420.is_empty() {
+        return Err(Error::DecodeError(format!(
+            "decoder output does not fit layout {:?} color-format 0x{:x} stride {} slice-height {} image-data={} ({} bytes)",
+            crop,
+            layout.color_format,
+            layout.stride,
+            layout.slice_height,
+            layout.planes.is_some(),
             raw.len()
         )));
     }
