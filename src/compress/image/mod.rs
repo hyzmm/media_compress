@@ -107,6 +107,20 @@ pub(crate) const WEBP_INPUT_REJECTED: &str =
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Quality used when the caller supplies a non-finite value.
+pub(crate) const DEFAULT_QUALITY: f32 = 75.0;
+
+/// Clamp a caller-supplied WebP quality to libwebp's `0..=100` range.
+/// Non-finite values fall back to [`DEFAULT_QUALITY`] so they never reach the
+/// C encoder or the browser canvas API.
+pub(crate) fn normalize_quality(quality: f32) -> f32 {
+    if quality.is_finite() {
+        quality.clamp(0.0, 100.0)
+    } else {
+        DEFAULT_QUALITY
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CompressOptions {
     pub quality: f32,
@@ -126,7 +140,7 @@ impl CompressOptions {
 
 impl Default for CompressOptions {
     fn default() -> Self {
-        Self::new(75.0)
+        Self::new(DEFAULT_QUALITY)
     }
 }
 
@@ -170,7 +184,8 @@ pub(crate) fn compute_target_dimensions(
 /// * `input`   — raw bytes of the source image (any supported format)
 /// * `options` — compression options:
 ///   - `quality`: lossy quality, 0–100 (drives the WebP encoder; the GIF
-///     quantizer currently ignores it)
+///     quantizer currently ignores it). Values outside the range are clamped;
+///     non-finite values use the default 75.
 ///   - `min_width` / `min_height`: optional lower bound for output size.
 ///     Compression may downscale while preserving aspect ratio, but will not
 ///     upscale when the source image is already smaller.
@@ -183,6 +198,14 @@ pub(crate) fn compute_target_dimensions(
 /// | Windows  | JPEG, PNG, GIF (→ GIF), BMP, TIFF |
 /// | Web/WASM | not supported; use `compress_image_js` instead |
 pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>, Error> {
+    // Clamp before any backend sees it: libwebp only accepts 0–100, and
+    // non-finite floats have no meaningful interpretation.
+    let options = CompressOptions {
+        quality: normalize_quality(options.quality),
+        min_width: options.min_width,
+        min_height: options.min_height,
+    };
+
     // Validate or detect format (used only for error messages if the platform
     // rejects the input; the native API handles actual format detection).
     let fmt = ImageFormat::detect(input).ok_or_else(|| {
@@ -231,7 +254,17 @@ pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>,
 
 #[cfg(test)]
 mod tests {
-    use super::compute_target_dimensions;
+    use super::{compute_target_dimensions, normalize_quality, DEFAULT_QUALITY};
+
+    #[test]
+    fn quality_is_clamped_and_non_finite_falls_back() {
+        assert_eq!(normalize_quality(75.0), 75.0);
+        assert_eq!(normalize_quality(-20.0), 0.0);
+        assert_eq!(normalize_quality(120.0), 100.0);
+        assert_eq!(normalize_quality(f32::NAN), DEFAULT_QUALITY);
+        assert_eq!(normalize_quality(f32::INFINITY), DEFAULT_QUALITY);
+        assert_eq!(normalize_quality(f32::NEG_INFINITY), DEFAULT_QUALITY);
+    }
 
     #[test]
     fn no_min_constraints_keep_original_dimensions() {

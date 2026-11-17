@@ -101,6 +101,28 @@ fn compress_test_image_gif_to_gif() {
 }
 
 #[test]
+fn invalid_quality_is_normalized_before_encoding() {
+    let input = include_bytes!("../test_images/test_image.bmp");
+
+    for quality in [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        -50.0,
+        0.0,
+        100.0,
+        150.0,
+    ] {
+        let out = compress_image(input, CompressOptions::new(quality))
+            .unwrap_or_else(|e| panic!("quality {quality} failed: {e}"));
+        assert!(
+            is_webp(&out),
+            "quality {quality} did not produce WebP output"
+        );
+    }
+}
+
+#[test]
 fn compress_webp_input_is_rejected() {
     let input = include_bytes!("../test_images/test_image.webp");
 

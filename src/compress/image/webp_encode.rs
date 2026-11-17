@@ -7,7 +7,7 @@ pub fn encode_static(pixels: &[u8], w: u32, h: u32, quality: f32) -> Result<Vec<
     let mut config =
         WebPConfig::new().map_err(|_| Error::EncodeError("WebPConfig::new() failed".into()))?;
     config.lossless = 0;
-    config.quality = quality;
+    config.quality = super::normalize_quality(quality);
     config.thread_level = 1;
     config.method = 4;
 

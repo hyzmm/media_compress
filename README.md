@@ -43,7 +43,7 @@
 
 ### 3. 压缩策略
 
-- 质量参数：`quality` 取值 0-100（常用 75）；对 GIF 输出暂不生效（quantette 不读取该参数）
+- 质量参数：`quality` 取值 0-100（常用 75）；超出范围会收敛到 0/100，非有限值回退到 75；对 GIF 输出暂不生效（quantette 不读取该参数）
 - 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
 - 透明通道：Apple / Android 解码器输出预乘 Alpha，编码 WebP 前会还原为直通 Alpha，避免半透明像素和边缘发暗；Windows / WASM 解码器本身输出直通 Alpha
 - Native 编码配置：有损 WebP + 多线程

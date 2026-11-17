@@ -81,7 +81,8 @@ async fn canvas_compress(
 /// # Arguments
 /// * `input`   — raw bytes of the source image
 /// * `quality` — lossy quality, 0–100 (drives the WebP encoder; the GIF
-///   quantizer currently ignores it)
+///   quantizer currently ignores it). Values outside the range are clamped;
+///   non-finite values use the default 75.
 /// * `min_width` / `min_height` — optional lower bound for output dimensions.
 ///   The output keeps the original aspect ratio and never upscales.
 ///
@@ -98,6 +99,7 @@ pub async fn compress_image_js(
     min_width: Option<u32>,
     min_height: Option<u32>,
 ) -> Result<Uint8Array, JsValue> {
+    let quality = super::normalize_quality(quality);
     let detected = ImageFormat::detect(input);
     if detected == Some(ImageFormat::Webp) {
         return Err(JsValue::from_str(WEBP_INPUT_REJECTED));

@@ -59,7 +59,7 @@ pub(crate) fn compress_gif(input: &[u8], options: CompressOptions) -> Result<Vec
     // in the source animation. That makes the previous frame irrelevant as a
     // transparency mask, so palette building and quantization stay RGB-only.
     let mut config = QuantizeConfig::default();
-    config.quality = options.quality.round().clamp(1.0, 100.0) as u8;
+    config.quality = super::normalize_quality(options.quality).round() as u8;
     config.dithering = 0.0;
     config.use_background = false;
 
