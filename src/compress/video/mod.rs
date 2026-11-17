@@ -70,6 +70,12 @@ impl VideoFormat {
         // ISO Base Media File Format (mp4 / mov / m4v / 3gp / …): "ftyp" box
         if &data[4..8] == b"ftyp" {
             let brand = &data[8..12];
+            // `ftyp` is shared by images and audio-only containers. Those are
+            // not videos, and handing them to a video backend only produces a
+            // misleading "no video track" decode error.
+            if is_image_ftyp_brand(brand) || is_audio_only_ftyp_brand(brand) {
+                return None;
+            }
             return match brand {
                 b"qt  " => Some(Self::QuickTime),
                 _ => Some(Self::Mp4),
@@ -93,6 +99,34 @@ impl VideoFormat {
 
         None
     }
+}
+
+/// HEIF/AVIF image brands (ISO/IEC 23008-12 and the AVIF specification).
+/// These files use the ISO BMFF `ftyp` box but contain still images, not video
+/// tracks.
+fn is_image_ftyp_brand(brand: &[u8]) -> bool {
+    matches!(
+        brand,
+        b"heic"
+            | b"heix"
+            | b"hevc"
+            | b"hevx"
+            | b"heim"
+            | b"heis"
+            | b"hevm"
+            | b"hevs"
+            | b"mif1"
+            | b"msf1"
+            | b"avif"
+            | b"avis"
+    )
+}
+
+/// Audio-only ISO BMFF brands: iTunes/QuickTime audio (`.m4a`, `.m4b`, `.m4p`)
+/// and Adobe Flash audio (`.f4a`, `.f4b`). None of them can carry a video
+/// track.
+fn is_audio_only_ftyp_brand(brand: &[u8]) -> bool {
+    matches!(brand, b"M4A " | b"M4B " | b"M4P " | b"F4A " | b"F4B ")
 }
 
 // ---------------------------------------------------------------------------
@@ -520,8 +554,72 @@ fn compress_video_file_platform(
 mod tests {
     use super::{
         compute_video_target_dimensions, crf_to_quality_100, crf_to_quality_unit,
-        fit_video_dimensions, H264Target, VideoCompressOptions, DEFAULT_CRF,
+        fit_video_dimensions, H264Target, VideoCompressOptions, VideoFormat, DEFAULT_CRF,
     };
+
+    fn ftyp_brand(brand: &[u8; 4]) -> Vec<u8> {
+        let mut data = vec![0, 0, 0, 12, b'f', b't', b'y', b'p'];
+        data.extend_from_slice(brand);
+        data
+    }
+
+    #[test]
+    fn detects_video_ftyp_brands() {
+        for brand in [
+            b"isom", b"mp41", b"mp42", b"M4V ", b"3gp4", b"3g2a", b"avc1",
+        ] {
+            assert_eq!(
+                VideoFormat::detect(&ftyp_brand(brand)),
+                Some(VideoFormat::Mp4),
+                "brand {} should be treated as MP4",
+                std::str::from_utf8(brand).unwrap()
+            );
+        }
+        assert_eq!(
+            VideoFormat::detect(&ftyp_brand(b"qt  ")),
+            Some(VideoFormat::QuickTime)
+        );
+    }
+
+    #[test]
+    fn rejects_image_ftyp_brands() {
+        for brand in [
+            b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1",
+            b"msf1", b"avif", b"avis",
+        ] {
+            assert_eq!(
+                VideoFormat::detect(&ftyp_brand(brand)),
+                None,
+                "image brand {} must not be treated as video",
+                std::str::from_utf8(brand).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_audio_only_ftyp_brands() {
+        for brand in [b"M4A ", b"M4B ", b"M4P ", b"F4A ", b"F4B "] {
+            assert_eq!(
+                VideoFormat::detect(&ftyp_brand(brand)),
+                None,
+                "audio brand {} must not be treated as video",
+                std::str::from_utf8(brand).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn compress_video_rejects_non_video_ftyp_inputs() {
+        for brand in [b"heic", b"avif", b"M4A "] {
+            let error = super::compress_video(&ftyp_brand(brand), VideoCompressOptions::default())
+                .expect_err("non-video ftyp input must be rejected");
+            assert!(
+                matches!(error, crate::error::Error::UnsupportedFormat(_)),
+                "brand {} returned {error:?}",
+                std::str::from_utf8(brand).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn keeps_source_dimensions() {

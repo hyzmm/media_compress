@@ -168,7 +168,7 @@ let out = compress_video(&input, options)?;
 std::fs::write("out.mp4", out)?;
 ```
 
-- 支持的源容器：MP4 / MOV（QuickTime）等平台可解码格式。
+- 支持的源容器：MP4 / MOV（QuickTime）等平台可解码格式。`ftyp` 魔数会和图片/纯音频容器共用：HEIC / AVIF 等 HEIF 图片与 M4A / M4B / M4P / F4A / F4B 纯音频文件会在格式检测阶段被拒绝（返回 `UnsupportedFormat`），不会进入视频后端再报「找不到视频轨」。
 - CRF 的平台落点：macOS / iOS 使用 VideoToolbox 的 Quality（0–1）属性；Android API 28+ 使用 MediaCodec CQ + quality，老版本回退到 CRF 等价码率；Windows 的 MF sink writer 只暴露平均码率，因此按 CRF 换算目标码率（VBR）。
 - macOS / iOS 会把视频轨的 `preferredTransform` 应用到输出，Android 读取 `rotation-degrees` 并把帧物理旋转为正向，Windows 读取 `MF_MT_VIDEO_ROTATION` 并按逆时针角度旋转解码帧，竖屏/旋转视频都保持正确方向。
 - Android 的编码器尺寸回退：先按源尺寸配置 MediaCodec；若编码器不接受（常见于 1344×2992、1080×2400 这类竖屏录屏），再按 `max_width`/`max_height` 与 1920/1280/720 档等比缩小重试，帧在 CPU 侧同步缩放。正常尺寸的视频不会降分辨率。
