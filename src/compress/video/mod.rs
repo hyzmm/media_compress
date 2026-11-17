@@ -31,6 +31,11 @@ mod transform;
 #[cfg(any(target_os = "android", test))]
 mod yuv;
 
+// Pure-Rust PCM conversion used by the Android path; compiled on Android and
+// during `cargo test` (so every decoder output encoding is covered on the host).
+#[cfg(any(target_os = "android", test))]
+mod android_audio;
+
 // Pure-Rust BGRA32 scaler used by the Windows path; compiled on Windows and
 // during `cargo test` (so its unit tests run on the host).
 #[cfg(any(target_os = "windows", test))]

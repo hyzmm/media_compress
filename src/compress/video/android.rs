@@ -3,6 +3,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::android_audio::{self, PCM_ENCODING_16BIT};
 use super::yuv::{self, CropRect};
 use super::{
     compute_video_target_dimensions, crf_to_quality_100, fit_video_dimensions, H264Target,
@@ -706,6 +707,7 @@ unsafe fn transcode_fd(
     let mut audio_channels = audio_track
         .as_ref()
         .map_or(DEFAULT_CHANNELS, |t| t.channel_count);
+    let mut audio_pcm_encoding = PCM_ENCODING_16BIT;
     let mut pending_audio_pcm: Option<(Vec<u8>, i64)> = None;
     let mut pending_audio_samples: Vec<PendingSample> = Vec::new();
 
@@ -912,6 +914,8 @@ unsafe fn transcode_fd(
                             audio_channels = format_i32(fmt.0, c"channel-count")
                                 .unwrap_or(audio_channels)
                                 .max(1);
+                            audio_pcm_encoding =
+                                format_i32(fmt.0, c"pcm-encoding").unwrap_or(audio_pcm_encoding);
                         }
                         if audio_encoder.is_none() {
                             audio_encoder = Some(create_audio_encoder(audio_rate, audio_channels)?);
@@ -923,10 +927,10 @@ unsafe fn transcode_fd(
                             let (ptr, capacity) = output_buffer(decoder, idx).ok_or_else(|| {
                                 Error::DecodeError("audio decoder output buffer unavailable".into())
                             })?;
-                            pending_audio_pcm = Some((
-                                output_slice(ptr, capacity, &info)?.to_vec(),
-                                info.presentation_time_us,
-                            ));
+                            let data = output_slice(ptr, capacity, &info)?;
+                            let pcm =
+                                android_audio::to_s16le(data, audio_pcm_encoding, audio_channels)?;
+                            pending_audio_pcm = Some((pcm.into_owned(), info.presentation_time_us));
                         }
                         AMediaCodec_releaseOutputBuffer(decoder.0, idx, 0);
                         progressed = true;
@@ -951,6 +955,8 @@ unsafe fn transcode_fd(
                 let (ptr, capacity) = input_buffer(encoder, idx).ok_or_else(|| {
                     Error::EncodeError("audio encoder input buffer unavailable".into())
                 })?;
+                // Decoder PCM is normalized to interleaved signed 16-bit by
+                // `to_s16le`, so every frame is exactly two bytes per channel.
                 let bytes_per_frame = (audio_channels as usize) * 2;
                 let mut take = pcm.len().min(capacity);
                 take -= take % bytes_per_frame;
