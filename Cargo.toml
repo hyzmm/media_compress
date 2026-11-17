@@ -20,6 +20,9 @@ zengif = { version = "0.7.3", default-features = false, features = [
     "std",
     "quantette",
 ] }
+# GIF re-encoding writes composited full frames with disposal=Background so
+# that transparent regions do not retain the previous frame.
+gif = { version = "0.14", default-features = false, features = ["std"] }
 
 # libwebp is not used on WASM — static WebP encoding is delegated to the
 # browser Canvas API.

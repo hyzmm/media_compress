@@ -500,6 +500,7 @@ dependencies = [
 name = "media_compress"
 version = "0.1.0"
 dependencies = [
+ "gif",
  "image",
  "jni",
  "js-sys",

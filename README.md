@@ -20,6 +20,7 @@
 - GIF（所有平台，含 Web）
     - 解码/编码：zengif（纯 Rust；quantette 量化器，MIT/Apache-2.0。zengif 默认启用的 zenquant 为 AGPL，未启用）
     - GIF → GIF；解码后按 `min_width`/`min_height` 下采样；输出大于输入则回退原字节
+    - 透明度：量化器只处理 RGB，透明像素解码后 RGB 为 0，可能与不透明黑色共用调色板索引。编码前会为透明像素单独选择（必要时追加）一个不被不透明像素使用的索引，所有透明像素统一指向该索引；完整合成帧以 `disposal=Background` 写入，透明区域不会残留上一帧内容
 
 - macOS / iOS
     - 解码：ImageIO + CoreGraphics
@@ -46,7 +47,7 @@
 - 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
 - 透明通道：Apple / Android 解码器输出预乘 Alpha，编码 WebP 前会还原为直通 Alpha，避免半透明像素和边缘发暗；Windows / WASM 解码器本身输出直通 Alpha
 - Native 编码配置：有损 WebP + 多线程
-- GIF：输出 GIF（GIF→GIF）。zengif 解码 + quantette 量化重编码，帧延迟与循环次数按源原样保留（不合并、不调整）；输出大于输入时回退原字节
+- GIF：输出 GIF（GIF→GIF）。zengif 解码 + quantette 量化重编码，帧延迟与循环次数按源原样保留（不合并、不调整）；透明色使用独立调色板索引，完整帧以 `disposal=Background` 重绘，不会把不透明黑色误标为透明或留下残影；输出大于输入时回退原字节
 - 动图处理：非 GIF 动图（APNG）输入导出 WebP 首帧（poster frame）
 
 ## 各平台图片格式支持情况
