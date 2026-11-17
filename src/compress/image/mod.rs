@@ -79,7 +79,16 @@ impl ImageFormat {
                 let brand = &d[8..12];
                 if matches!(
                     brand,
-                    b"heic" | b"heix" | b"heim" | b"heis" | b"hevm" | b"hevs" | b"mif1" | b"msf1"
+                    b"heic"
+                        | b"heix"
+                        | b"hevc"
+                        | b"hevx"
+                        | b"heim"
+                        | b"heis"
+                        | b"hevm"
+                        | b"hevs"
+                        | b"mif1"
+                        | b"msf1"
                 ) {
                     Some(Self::Heic)
                 } else {
@@ -254,7 +263,34 @@ pub fn compress_image(input: &[u8], options: CompressOptions) -> Result<Vec<u8>,
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_target_dimensions, normalize_quality, DEFAULT_QUALITY};
+    use super::{compute_target_dimensions, normalize_quality, ImageFormat, DEFAULT_QUALITY};
+
+    fn ftyp_brand(brand: &[u8; 4]) -> Vec<u8> {
+        let mut data = vec![0, 0, 0, 12, b'f', b't', b'y', b'p'];
+        data.extend_from_slice(brand);
+        data
+    }
+
+    #[test]
+    fn detects_all_heif_major_brands() {
+        for brand in [
+            b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1",
+            b"msf1",
+        ] {
+            assert_eq!(
+                ImageFormat::detect(&ftyp_brand(brand)),
+                Some(ImageFormat::Heic),
+                "brand {} should be detected as HEIC",
+                std::str::from_utf8(brand).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn mp4_brand_is_not_treated_as_heic_image() {
+        assert_eq!(ImageFormat::detect(&ftyp_brand(b"mp42")), None);
+        assert_eq!(ImageFormat::detect(&ftyp_brand(b"qt  ")), None);
+    }
 
     #[test]
     fn quality_is_clamped_and_non_finite_falls_back() {
