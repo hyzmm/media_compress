@@ -52,6 +52,13 @@ struct CMTimeRange {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct CMTimeMapping {
+    source: CMTimeRange,
+    target: CMTimeRange,
+}
+
+#[repr(C)]
 struct CFDictionaryKeyCallBacks {
     version: i64,
     retain: *const c_void,
@@ -117,6 +124,7 @@ macro_rules! define_msg_send {
 define_msg_send! {
     msg_id() -> Id;
     msg_id1(a: Id) -> Id;
+    msg_id_index(index: usize) -> Id;
     msg_id2(a: Id, b: Id) -> Id;
     msg_id_err(a: Id, err: *mut *mut c_void) -> Id;
     msg_id2_err(a: Id, b: Id, err: *mut *mut c_void) -> Id;
@@ -161,10 +169,19 @@ unsafe fn msg_stret_transform(ret: *mut CGAffineTransform, receiver: Id, sel: Se
     send(ret, receiver, sel);
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn msg_stret_mapping(ret: *mut CMTimeMapping, receiver: Id, sel: Sel) {
+    let send: unsafe extern "C" fn(*mut CMTimeMapping, Id, Sel) =
+        std::mem::transmute(objc_msg_send_stret_raw as unsafe extern "C" fn());
+    send(ret, receiver, sel);
+}
+
 #[cfg(target_arch = "aarch64")]
 define_msg_send! {
     msg_cmtime() -> CMTime;
     msg_transform() -> CGAffineTransform;
+    msg_mapping() -> CMTimeMapping;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +213,17 @@ extern "C" {
 
     static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
     static kCFTypeDictionaryValueCallBacks: CFDictionaryKeyCallBacks;
+}
+
+// ---------------------------------------------------------------------------
+// FFI — CoreMedia time arithmetic
+// ---------------------------------------------------------------------------
+
+#[link(name = "CoreMedia", kind = "framework")]
+extern "C" {
+    fn CMTimeAdd(lhs: CMTime, rhs: CMTime) -> CMTime;
+    fn CMTimeSubtract(lhs: CMTime, rhs: CMTime) -> CMTime;
+    fn CMTimeCompare(lhs: CMTime, rhs: CMTime) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,10 +308,137 @@ unsafe fn cmtime_property(object: Id, selector: Sel) -> CMTime {
     }
 }
 
-/// A frame duration is usable when it is valid and represents a plausible
-/// video cadence. `minFrameDuration` can be tiny on variable-frame-rate screen
-/// recordings (a few high-speed frames), and feeding that straight into the
-/// composition would render at an absurd rate, so clamp the accepted range.
+fn cmtime_is_valid(t: CMTime) -> bool {
+    t.flags & K_CMTIME_FLAGS_VALID != 0 && t.timescale > 0
+}
+
+fn cmtime_compare(lhs: CMTime, rhs: CMTime) -> i32 {
+    unsafe { CMTimeCompare(lhs, rhs) }
+}
+
+/// Earliest non-negative start time among the supplied track ranges.
+///
+/// `AVAssetWriter.startSessionAtSourceTime` rebases the output timeline to
+/// this value. Using the earliest track start avoids emitting a long frozen
+/// frame or silence before the real first sample, while still preserving the
+/// relative offset when one track starts later than another.
+fn earliest_track_start(ranges: &[CMTimeRange]) -> CMTime {
+    let zero = cmtime_numeric_zero();
+    let mut earliest: Option<CMTime> = None;
+    for range in ranges {
+        if !cmtime_is_valid(range.start) {
+            continue;
+        }
+        if earliest.is_none_or(|current| cmtime_compare(range.start, current) < 0) {
+            earliest = Some(range.start);
+        }
+    }
+    match earliest {
+        Some(start) if cmtime_compare(start, zero) >= 0 => start,
+        _ => zero,
+    }
+}
+
+unsafe fn cmtime_mapping_property(object: Id, selector: Sel) -> CMTimeMapping {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut mapping = CMTimeMapping {
+            source: CMTimeRange {
+                start: cmtime_numeric_zero(),
+                duration: cmtime_numeric_zero(),
+            },
+            target: CMTimeRange {
+                start: cmtime_numeric_zero(),
+                duration: cmtime_numeric_zero(),
+            },
+        };
+        msg_stret_mapping(&mut mapping, object, selector);
+        mapping
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        msg_mapping(object, selector)
+    }
+}
+
+/// Time range covered by the track's non-empty segments.
+///
+/// `AVAssetTrack.timeRange` starts at zero and stretches across leading empty
+/// edits, which makes a late-starting video look like it begins at zero. The
+/// segments' `timeMapping.target` values identify where real media actually
+/// starts and ends.
+unsafe fn track_media_range(track: Id) -> Option<CMTimeRange> {
+    let segments = msg_id(track, sel(c"segments"));
+    if segments.is_null() {
+        return None;
+    }
+
+    let count = msg_usize(segments, sel(c"count"));
+    let mut start: Option<CMTime> = None;
+    let mut end: Option<CMTime> = None;
+
+    for index in 0..count {
+        let segment = msg_id_index(segments, sel(c"objectAtIndex:"), index);
+        if segment.is_null() || msg_bool(segment, sel(c"isEmpty")) != 0 {
+            continue;
+        }
+
+        let mapping = cmtime_mapping_property(segment, sel(c"timeMapping"));
+        let target = mapping.target;
+        if !cmtime_is_valid(target.start)
+            || !cmtime_is_valid(target.duration)
+            || target.duration.value <= 0
+        {
+            continue;
+        }
+
+        let segment_end = CMTimeAdd(target.start, target.duration);
+        if !cmtime_is_valid(segment_end) {
+            continue;
+        }
+
+        if start.is_none_or(|current| cmtime_compare(target.start, current) < 0) {
+            start = Some(target.start);
+        }
+        if end.is_none_or(|current| cmtime_compare(segment_end, current) > 0) {
+            end = Some(segment_end);
+        }
+    }
+
+    let (start, end) = (start?, end?);
+    let duration = CMTimeSubtract(end, start);
+    if !cmtime_is_valid(duration) || cmtime_compare(duration, cmtime_numeric_zero()) <= 0 {
+        return None;
+    }
+    Some(CMTimeRange { start, duration })
+}
+
+/// Restrict a reader to a track's real media range.
+///
+/// Without this, a reader outputs the track's leading empty edit and
+/// `AVAssetReaderVideoCompositionOutput` holds the first real frame across
+/// the whole gap. A per-track reader can simply start at the first sample;
+/// the writer then preserves the offset relative to the other track.
+unsafe fn set_reader_time_range(reader: Id, range: Option<CMTimeRange>) {
+    let Some(range) = usable_reader_range(range) else {
+        return;
+    };
+    msg_set_timerange(reader, sel(c"setTimeRange:"), range);
+}
+
+fn usable_reader_range(range: Option<CMTimeRange>) -> Option<CMTimeRange> {
+    let range = range?;
+    let zero = cmtime_numeric_zero();
+    if !cmtime_is_valid(range.start)
+        || !cmtime_is_valid(range.duration)
+        || cmtime_compare(range.start, zero) < 0
+        || cmtime_compare(range.duration, zero) <= 0
+    {
+        return None;
+    }
+    Some(range)
+}
+
 fn usable_frame_duration(t: CMTime) -> bool {
     if t.flags & K_CMTIME_FLAGS_VALID == 0 || t.value <= 0 || t.timescale <= 0 {
         return false;
@@ -467,6 +622,26 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
             std::ptr::null_mut()
         };
 
+        // Leading empty edits are common in recordings and exports. Use the
+        // actual media ranges so the composition does not hold the first frame
+        // across the empty edit, and start the writer session at the earliest
+        // real sample.
+        let video_media_range = track_media_range(video_track);
+        let audio_media_range = has_audio.then(|| track_media_range(audio_track)).flatten();
+        let mut track_starts = Vec::with_capacity(2);
+        if let Some(range) = video_media_range {
+            track_starts.push(range);
+        }
+        if let Some(range) = audio_media_range {
+            track_starts.push(range);
+        }
+        let session_start = earliest_track_start(&track_starts);
+        let asset_end = asset_duration(asset);
+        let composition_range = video_media_range.unwrap_or_else(|| CMTimeRange {
+            start: cmtime_numeric_zero(),
+            duration: asset_end,
+        });
+
         // ── Video composition (scaling) ──────────────────────────────────
         let comp = msg_id(
             class(c"AVMutableVideoComposition"),
@@ -508,7 +683,8 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
             },
         );
 
-        // Single instruction covering the whole asset, with a scale transform.
+        // Single instruction covering the track's real media range, with a
+        // scale transform.
         let instruction = msg_id(
             class(c"AVMutableVideoCompositionInstruction"),
             sel(c"videoCompositionInstruction"),
@@ -518,15 +694,7 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
                 "videoCompositionInstruction creation failed".into(),
             ));
         }
-        let duration = asset_duration(asset);
-        msg_set_timerange(
-            instruction,
-            sel(c"setTimeRange:"),
-            CMTimeRange {
-                start: cmtime_numeric_zero(),
-                duration,
-            },
-        );
+        msg_set_timerange(instruction, sel(c"setTimeRange:"), composition_range);
 
         let layer = msg_id1(
             class(c"AVMutableVideoCompositionLayerInstruction"),
@@ -548,19 +716,29 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
 
         let layer_array = msg_id1(class(c"NSArray"), sel(c"arrayWithObject:"), layer);
         msg_void1(instruction, sel(c"setLayerInstructions:"), layer_array);
-        let inst_array = msg_id1(class(c"NSArray"), sel(c"arrayWithObject:"), instruction);
-        msg_void1(comp, sel(c"setInstructions:"), inst_array);
 
-        // ── Reader ───────────────────────────────────────────────────────
-        let reader = msg_id_err(
+        let instructions = msg_id1(class(c"NSArray"), sel(c"arrayWithObject:"), instruction);
+        msg_void1(comp, sel(c"setInstructions:"), instructions);
+
+        // ── Video reader ─────────────────────────────────────────────────
+        // Reading video and audio through one reader forces the video
+        // composition to span the union of both tracks. Empty edits then make
+        // AVAssetReader hold the first real frame (or emit a sample before the
+        // writer session) across the gap. A dedicated reader per track lets
+        // each one start at its own first real sample; the writer keeps the
+        // relative offset because the session starts at the earliest track.
+        let video_reader = msg_id_err(
             class(c"AVAssetReader"),
             sel(c"assetReaderWithAsset:error:"),
             asset,
             std::ptr::null_mut(),
         );
-        if reader.is_null() {
-            return Err(Error::DecodeError("AVAssetReader creation failed".into()));
+        if video_reader.is_null() {
+            return Err(Error::DecodeError(
+                "AVAssetReader (video) creation failed".into(),
+            ));
         }
+        set_reader_time_range(video_reader, video_media_range);
 
         let video_output = msg_id2(
             class(c"AVAssetReaderVideoCompositionOutput"),
@@ -574,7 +752,25 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
             ));
         }
         msg_void1(video_output, sel(c"setVideoComposition:"), comp);
-        msg_void1(reader, sel(c"addOutput:"), video_output);
+        msg_void1(video_reader, sel(c"addOutput:"), video_output);
+
+        let audio_reader = if has_audio {
+            let reader = msg_id_err(
+                class(c"AVAssetReader"),
+                sel(c"assetReaderWithAsset:error:"),
+                asset,
+                std::ptr::null_mut(),
+            );
+            if reader.is_null() {
+                return Err(Error::DecodeError(
+                    "AVAssetReader (audio) creation failed".into(),
+                ));
+            }
+            set_reader_time_range(reader, audio_media_range);
+            reader
+        } else {
+            std::ptr::null_mut()
+        };
 
         let audio_output = if has_audio {
             let lpcm_num = cf_number_i32(K_AUDIO_FORMAT_LINEAR_PCM);
@@ -599,7 +795,7 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
                     "audio reader output creation failed".into(),
                 ));
             }
-            msg_void1(reader, sel(c"addOutput:"), out);
+            msg_void1(audio_reader, sel(c"addOutput:"), out);
             out
         } else {
             std::ptr::null_mut()
@@ -689,23 +885,30 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
         };
 
         // ── Start ────────────────────────────────────────────────────────
-        if msg_bool(reader, sel(c"startReading")) == 0 {
+        if msg_bool(video_reader, sel(c"startReading")) == 0 {
             msg_void(writer, sel(c"cancelWriting"));
             return Err(Error::DecodeError(
-                "AVAssetReader startReading failed".into(),
+                "AVAssetReader (video) startReading failed".into(),
+            ));
+        }
+        if has_audio && msg_bool(audio_reader, sel(c"startReading")) == 0 {
+            msg_void(video_reader, sel(c"cancelReading"));
+            msg_void(writer, sel(c"cancelWriting"));
+            return Err(Error::DecodeError(
+                "AVAssetReader (audio) startReading failed".into(),
             ));
         }
         if msg_bool(writer, sel(c"startWriting")) == 0 {
+            if has_audio {
+                msg_void(audio_reader, sel(c"cancelReading"));
+            }
+            msg_void(video_reader, sel(c"cancelReading"));
             msg_void(writer, sel(c"cancelWriting"));
             return Err(Error::EncodeError(
                 "AVAssetWriter startWriting failed".into(),
             ));
         }
-        msg_set_cmtime(
-            writer,
-            sel(c"startSessionAtSourceTime:"),
-            cmtime_numeric_zero(),
-        );
+        msg_set_cmtime(writer, sel(c"startSessionAtSourceTime:"), session_start);
 
         // ── Pump samples ─────────────────────────────────────────────────
         let mut video_done = false;
@@ -760,7 +963,10 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
         }
 
         // ── Finish ───────────────────────────────────────────────────────
-        if msg_isize(reader, sel(c"status")) == AV_ASSET_READER_STATUS_FAILED {
+        if msg_isize(video_reader, sel(c"status")) == AV_ASSET_READER_STATUS_FAILED
+            || (has_audio
+                && msg_isize(audio_reader, sel(c"status")) == AV_ASSET_READER_STATUS_FAILED)
+        {
             msg_void(writer, sel(c"cancelWriting"));
             return Err(Error::DecodeError(
                 "AVAssetReader failed during reading".into(),
@@ -793,7 +999,10 @@ unsafe fn transcode(in_path: &Path, out_path: &Path, target: H264Target) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{usable_frame_duration, CMTime, K_CMTIME_FLAGS_VALID};
+    use super::{
+        earliest_track_start, usable_frame_duration, usable_reader_range, CMTime, CMTimeRange,
+        K_CMTIME_FLAGS_VALID,
+    };
 
     fn cmtime(value: i64, timescale: i32, flags: u32) -> CMTime {
         CMTime {
@@ -802,6 +1011,14 @@ mod tests {
             flags,
             epoch: 0,
         }
+    }
+
+    fn time_range(start: CMTime, duration: CMTime) -> CMTimeRange {
+        CMTimeRange { start, duration }
+    }
+
+    fn valid(value: i64, timescale: i32) -> CMTime {
+        cmtime(value, timescale, K_CMTIME_FLAGS_VALID)
     }
 
     #[test]
@@ -832,5 +1049,51 @@ mod tests {
             1000,
             K_CMTIME_FLAGS_VALID
         )));
+    }
+
+    #[test]
+    fn session_starts_at_earliest_real_track_start() {
+        let ranges = [
+            time_range(valid(5, 1), valid(2, 1)),
+            time_range(valid(499, 100), valid(2, 1)),
+        ];
+        let start = earliest_track_start(&ranges);
+        assert_eq!(start.value, 499);
+        assert_eq!(start.timescale, 100);
+    }
+
+    #[test]
+    fn session_start_ignores_invalid_ranges() {
+        let ranges = [
+            time_range(cmtime(1, 30, 0), valid(2, 1)),
+            time_range(cmtime(0, 30, 0), valid(2, 1)),
+        ];
+        let start = earliest_track_start(&ranges);
+        assert_eq!(start.value, 0);
+        assert_eq!(start.timescale, 1);
+    }
+
+    #[test]
+    fn session_start_falls_back_to_zero_for_negative_or_empty_ranges() {
+        let negative = [time_range(valid(-1, 1), valid(2, 1))];
+        assert_eq!(earliest_track_start(&negative).value, 0);
+        assert_eq!(earliest_track_start(&[]).value, 0);
+    }
+
+    #[test]
+    fn reader_range_rejects_invalid_bounds() {
+        assert!(usable_reader_range(None).is_none());
+        assert!(usable_reader_range(Some(time_range(valid(-1, 1), valid(2, 1)))).is_none());
+        assert!(usable_reader_range(Some(time_range(valid(0, 1), valid(0, 1)))).is_none());
+        assert!(usable_reader_range(Some(time_range(valid(0, 1), cmtime(2, 1, 0)))).is_none());
+        assert!(usable_reader_range(Some(time_range(cmtime(0, 1, 0), valid(2, 1)))).is_none());
+    }
+
+    #[test]
+    fn reader_range_keeps_real_track_bounds() {
+        let range = usable_reader_range(Some(time_range(valid(5, 1), valid(2, 1))))
+            .expect("valid range should be accepted");
+        assert_eq!(range.start.value, 5);
+        assert_eq!(range.duration.value, 2);
     }
 }

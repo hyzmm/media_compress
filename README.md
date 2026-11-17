@@ -152,7 +152,7 @@ const out = await compress_image_js(inputBytes, 75, 1280, 720);
 
 ## 视频压缩（macOS / iOS / Android / Windows）
 
-- macOS / iOS：通过 AVFoundation（AVAssetReader/AVAssetWriter）转码。视频合成帧时长取自轨道的 `minFrameDuration`，保留 24000/1001、30000/1001 等精确有理帧率，不再把 23.976 / 29.97 / 59.94 取整成 24 / 30 / 60，避免视频节奏和音频时长漂移。
+- macOS / iOS：通过 AVFoundation（AVAssetReader/AVAssetWriter）转码。视频合成帧时长取自轨道的 `minFrameDuration`，保留 24000/1001、30000/1001 等精确有理帧率，不再把 23.976 / 29.97 / 59.94 取整成 24 / 30 / 60，避免视频节奏和音频时长漂移。起始时间以轨道非空 `segments.timeMapping.target` 确定的真实媒体范围为准，视频和音频各用一个 `AVAssetReader` 从首帧/首个音频样本开始读取；写入会话从两者最早的真实起点开始，因此带前导空 edit 或非零起始 PTS 的文件不会再冻结首帧、产生负时间戳或把静音/末帧拉长，同时保留音画之间的相对偏移。
 - Android：通过 NDK 原生 MediaCodec + MediaMuxer（libmediandk）转码，无需调用方注入 `JavaVM`。解码帧的平面布局以 MediaCodec 输出格式为准：优先读取 `image-data`（`MediaImage2` / 旧版 `MediaImage`）中的 Y/U/V 偏移与步长，因此 `COLOR_FormatYUV420Flexible` 和厂商格式不会被固定当成 NV12；没有该描述符时只接受标准 I420/NV12/NV21，其他布局直接报错，不再静默输出黑帧。`frame-rate` 只作为 MediaCodec 的整数码控提示，实际输出时间戳沿用解码帧 PTS，29.97 等小数帧率不会被改成 30 fps 的时间轴。
 - Windows：通过 Media Foundation（IMFSourceReader / IMFSinkWriter）转码。优先读取解码器的原生 NV12 输出并在 CPU 转为 RGBA——按实际缓冲长度推导 stride 与 coded 高度（解码器可能输出比显示尺寸更大的缓冲，直接按显示 stride 读取会造成逐行错位），再裁切到显示尺寸；无法识别的格式回退到 Video Processor 的 RGB32。随后编码为 H.264，音频重编码为 AAC。源帧率以 `MF_MT_FRAME_RATE` 的有理数保留（例如 30000/1001），仅在码率估算时向上取整；样本缺少时长时也按精确帧率计算。读取循环只在 `MF_SOURCE_READERF_ENDOFSTREAM` 时结束：流 tick、媒体类型变化等空样本会继续读取，EOS 同时带样本时先写入该样本。Media Foundation 在进程内只初始化一次并保持到进程结束，每次压缩不再成对调用 `MFShutdown`，因此并发压缩不会互相关闭平台。解码样本由拥有所有权的 RAII guard 管理，写入失败或提前返回时也会释放，不再泄漏 `IMFSample`。
 
