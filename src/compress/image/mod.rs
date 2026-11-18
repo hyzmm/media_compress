@@ -181,6 +181,12 @@ pub(crate) fn compute_target_dimensions(
         return (src_w, src_h);
     }
 
+    // A lower bound of zero is already satisfied by every image. Treat it as
+    // "no constraint" instead of letting it drive the scale to 0 (which would
+    // collapse the output to 1x1).
+    let min_width = min_width.filter(|width| *width > 0);
+    let min_height = min_height.filter(|height| *height > 0);
+
     if min_width.is_none() && min_height.is_none() {
         return (src_w, src_h);
     }
@@ -372,6 +378,27 @@ mod tests {
         assert_eq!(
             compute_target_dimensions(4000, 3000, Some(1000), Some(1200)),
             (1600, 1200)
+        );
+    }
+
+    #[test]
+    fn zero_minimum_is_treated_as_no_constraint() {
+        assert_eq!(
+            compute_target_dimensions(3000, 2000, Some(0), None),
+            (3000, 2000)
+        );
+        assert_eq!(
+            compute_target_dimensions(3000, 2000, None, Some(0)),
+            (3000, 2000)
+        );
+        assert_eq!(
+            compute_target_dimensions(3000, 2000, Some(0), Some(0)),
+            (3000, 2000)
+        );
+        // A zero bound must not override a positive bound.
+        assert_eq!(
+            compute_target_dimensions(3000, 2000, Some(0), Some(800)),
+            (1200, 800)
         );
     }
 }

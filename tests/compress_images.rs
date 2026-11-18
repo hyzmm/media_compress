@@ -75,6 +75,31 @@ fn compress_with_min_1080_dimensions() {
 }
 
 #[test]
+fn zero_min_dimensions_keep_source_size() {
+    let input = include_bytes!("../test_images/test_image.bmp");
+
+    let baseline =
+        compress_image(input, CompressOptions::new(75.0)).expect("compress_image baseline failed");
+    let (bw, bh) = webp_dimensions(&baseline).expect("failed to parse baseline dimensions");
+    assert!(bw > 1 && bh > 1, "fixture should not be 1x1");
+
+    for (min_width, min_height) in [(Some(0), None), (None, Some(0)), (Some(0), Some(0))] {
+        let mut options = CompressOptions::new(75.0);
+        options.min_width = min_width;
+        options.min_height = min_height;
+
+        let out = compress_image(input, options)
+            .unwrap_or_else(|e| panic!("min {min_width:?}x{min_height:?} failed: {e}"));
+        let (w, h) = webp_dimensions(&out).expect("failed to parse output dimensions");
+        assert_eq!(
+            (w, h),
+            (bw, bh),
+            "min {min_width:?}x{min_height:?} must not change output size"
+        );
+    }
+}
+
+#[test]
 fn compress_test_image_gif_to_gif() {
     let input = include_bytes!("../test_images/test_image.gif");
 

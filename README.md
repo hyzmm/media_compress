@@ -44,7 +44,7 @@
 ### 3. 压缩策略
 
 - 质量参数：`quality` 取值 0-100（常用 75）；超出范围会收敛到 0/100，非有限值回退到 75；对 GIF 输出暂不生效（quantette 不读取该参数）
-- 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图
+- 尺寸下限：`min_width` / `min_height` 可选；压缩时会按比例缩小并满足下限，不会放大小图。`0` 视为未设置（不会把输出压成 1×1）
 - 透明通道：Apple / Android 解码器输出预乘 Alpha，编码 WebP 前会还原为直通 Alpha，避免半透明像素和边缘发暗；Windows / WASM 解码器本身输出直通 Alpha
 - Native 编码配置：有损 WebP + 多线程
 - GIF：输出 GIF（GIF→GIF）。zengif 解码 + quantette 量化重编码，帧延迟与循环次数按源原样保留（不合并、不调整）；透明色使用独立调色板索引，完整帧以 `disposal=Background` 重绘，不会把不透明黑色误标为透明或留下残影；输出大于输入时回退原字节
