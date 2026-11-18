@@ -275,10 +275,20 @@ fn compress_all_test_images() {
 
         let data = fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", file_name, e));
 
+        // The fixture directory also holds videos (e.g. .mov files used by the
+        // video tests). Magic-byte detection decides what is an image; skip
+        // everything else instead of failing the image sweep.
+        let detected = ImageFormat::detect(&data);
+        if detected.is_none() {
+            eprintln!("  SKIP  {} — not a recognised image", file_name);
+            skipped += 1;
+            continue;
+        }
+
         let original_size = data.len();
         eprintln!("  COMPRESS  {}  size: {} bytes", file_name, original_size);
 
-        let expects_gif = ImageFormat::detect(&data) == Some(ImageFormat::Gif);
+        let expects_gif = detected == Some(ImageFormat::Gif);
 
         let t0 = Instant::now();
         match compress_image(&data, CompressOptions::new(75.0)) {
