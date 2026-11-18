@@ -8,21 +8,28 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Blob, ImageBitmap, ImageEncodeOptions, OffscreenCanvas, OffscreenCanvasRenderingContext2d,
+    Blob, BlobPropertyBag, ImageBitmap, ImageEncodeOptions, OffscreenCanvas,
+    OffscreenCanvasRenderingContext2d,
 };
 
 /// Decode raw image bytes with the browser-native `createImageBitmap`
 /// (JPEG, PNG, GIF, BMP, AVIF — varies by browser). For animated
 /// inputs this yields the first frame only.
 ///
+/// The blob carries the detected MIME type: `createImageBitmap` accepts a
+/// `Blob`, and browsers that do not sniff the container (notably Safari for
+/// HEIC) refuse to decode a typeless blob.
+///
 /// Resolved off the global object rather than `window` so the same code also
 /// runs inside a `Worker`, which has no `window` (both `Window` and
 /// `WorkerGlobalScope` expose `createImageBitmap`).
-async fn decode_to_bitmap(input: &[u8]) -> Result<ImageBitmap, JsValue> {
+async fn decode_to_bitmap(input: &[u8], mime_type: &str) -> Result<ImageBitmap, JsValue> {
     let bytes = Uint8Array::from(input);
     let array = js_sys::Array::of1(&bytes);
 
-    let blob = Blob::new_with_u8_array_sequence(&array)?;
+    let property_bag = BlobPropertyBag::new();
+    property_bag.set_type(mime_type);
+    let blob = Blob::new_with_u8_array_sequence_and_options(&array, &property_bag)?;
     let global = js_sys::global();
     let create_image_bitmap = js_sys::Reflect::get(&global, &JsValue::from_str("createImageBitmap"))?
         .dyn_into::<js_sys::Function>()
@@ -37,11 +44,12 @@ async fn decode_to_bitmap(input: &[u8]) -> Result<ImageBitmap, JsValue> {
 /// encode animations). GIF input is handled before this path.
 async fn canvas_compress(
     input: &[u8],
+    mime_type: &str,
     quality: f32,
     min_width: Option<u32>,
     min_height: Option<u32>,
 ) -> Result<Uint8Array, JsValue> {
-    let bitmap = decode_to_bitmap(input).await?;
+    let bitmap = decode_to_bitmap(input, mime_type).await?;
 
     let (target_w, target_h) =
         compute_target_dimensions(bitmap.width(), bitmap.height(), min_width, min_height);
@@ -107,6 +115,8 @@ pub async fn compress_image_js(
     let may_fallback = detected
         .as_ref()
         .map_or(false, |fmt| fmt.should_use_original_if_larger());
+    // Unknown containers keep an empty type and rely on browser sniffing.
+    let mime_type = detected.as_ref().map_or("", ImageFormat::mime_type);
 
     let js_bytes = Uint8Array::from(input);
 
@@ -126,7 +136,7 @@ pub async fn compress_image_js(
         return Ok(bytes);
     }
 
-    let compressed = canvas_compress(input, quality, min_width, min_height).await?;
+    let compressed = canvas_compress(input, mime_type, quality, min_width, min_height).await?;
 
     if may_fallback && compressed.length() as usize > input.len() {
         return Ok(js_bytes);

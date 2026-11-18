@@ -37,7 +37,7 @@
 
 - Web / WASM
     - GIF：与 Native 相同，走 zengif（GIF→GIF）
-    - 其余格式解码：`createImageBitmap`
+    - 其余格式解码：`createImageBitmap`；输入包装为 `Blob` 时会带上检测到的 MIME（JPEG/PNG/GIF/BMP/HEIC/TIFF），不依赖浏览器内容嗅探
     - 其余格式编码：`OffscreenCanvas.convertToBlob`，输出 `image/webp`
     - 注意：WASM 平台应使用异步 `compress_image_js`，同步 `compress_image` 在 WASM 下会返回不支持（GIF 除外）
 

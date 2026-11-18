@@ -105,6 +105,24 @@ impl ImageFormat {
     pub fn should_use_original_if_larger(&self) -> bool {
         matches!(self, Self::Jpeg | Self::Png | Self::Gif)
     }
+
+    /// MIME type used when handing the source bytes to a browser API.
+    ///
+    /// `createImageBitmap` accepts a `Blob`, and some browsers only decode
+    /// formats such as HEIC when the blob declares the matching type instead
+    /// of relying on content sniffing.
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn mime_type(&self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+            Self::Gif => "image/gif",
+            Self::Bmp => "image/bmp",
+            Self::Webp => "image/webp",
+            Self::Heic => "image/heic",
+            Self::Tiff => "image/tiff",
+        }
+    }
 }
 
 /// Error text shared by the native and Web entry points when the input is
@@ -290,6 +308,21 @@ mod tests {
     fn mp4_brand_is_not_treated_as_heic_image() {
         assert_eq!(ImageFormat::detect(&ftyp_brand(b"mp42")), None);
         assert_eq!(ImageFormat::detect(&ftyp_brand(b"qt  ")), None);
+    }
+
+    #[test]
+    fn detected_formats_map_to_browser_mime_types() {
+        for (format, mime) in [
+            (ImageFormat::Jpeg, "image/jpeg"),
+            (ImageFormat::Png, "image/png"),
+            (ImageFormat::Gif, "image/gif"),
+            (ImageFormat::Bmp, "image/bmp"),
+            (ImageFormat::Webp, "image/webp"),
+            (ImageFormat::Heic, "image/heic"),
+            (ImageFormat::Tiff, "image/tiff"),
+        ] {
+            assert_eq!(format.mime_type(), mime);
+        }
     }
 
     #[test]
