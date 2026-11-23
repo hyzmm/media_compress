@@ -179,8 +179,9 @@ const MF_MT_VIDEO_NOMINAL_RANGE: GUID = GUID {
     data3: 0x4071,
     data4: [0x8d, 0xaf, 0x32, 0x5e, 0xdf, 0x5c, 0xab, 0x11],
 };
-/// MF_MT_VIDEO_ROTATION: counter-clockwise rotation recorded by the container
-/// (0 / 90 / 180 / 270 degrees).
+/// MF_MT_VIDEO_ROTATION: how far the content was rotated counter-clockwise
+/// (0 / 90 / 180 / 270 degrees). Displaying it upright requires rotating the
+/// decoded frame clockwise by the same angle.
 const MF_MT_VIDEO_ROTATION: GUID = GUID {
     data1: 0xc380_465d,
     data2: 0x2271,
@@ -847,8 +848,9 @@ struct SourceSetup {
     layout: DecodedLayout,
     matrix: rgb::YuvMatrix,
     full_range: bool,
-    /// Counter-clockwise rotation from `MF_MT_VIDEO_ROTATION`, normalized to
-    /// 0 / 90 / 180 / 270 degrees.
+    /// Counter-clockwise content rotation from `MF_MT_VIDEO_ROTATION`,
+    /// normalized to 0 / 90 / 180 / 270 degrees. The frame is rotated back
+    /// clockwise by this amount for display.
     rotation: u32,
     /// First decoded video sample, read up front to sniff the real buffer
     /// geometry.
@@ -963,7 +965,7 @@ unsafe fn configure_source(
     let full_range =
         attr_get_u32(native, &MF_MT_VIDEO_NOMINAL_RANGE).ok() == Some(MF_NOMINAL_RANGE_0_255);
     // The source reader hands back unrotated decoder frames. The container's
-    // rotation is applied on the CPU before scaling.
+    // rotation is undone on the CPU before scaling.
     let rotation = attr_get_u32(native, &MF_MT_VIDEO_ROTATION)
         .map(rgb::normalize_rotation)
         .unwrap_or(0);
@@ -1517,13 +1519,14 @@ unsafe fn write_video_sample(
     }
 
     // Decoder buffers are unrotated even when the container records
-    // MF_MT_VIDEO_ROTATION. Rotate first so the scaler works on the displayed
-    // orientation (90/270 degree rotation swaps width and height).
+    // MF_MT_VIDEO_ROTATION. Undo the content's counter-clockwise rotation
+    // clockwise so the scaler works on the displayed orientation (90/270
+    // degree rotation swaps width and height).
     let rotated: Vec<u8>;
     let frame: &[u8] = if rotation == 0 {
         &bgra
     } else {
-        rotated = rgb::rotate_bgra_ccw(&bgra, src_w, src_h, rotation);
+        rotated = rgb::rotate_bgra_cw(&bgra, src_w, src_h, rotation);
         &rotated
     };
     if frame.is_empty() {

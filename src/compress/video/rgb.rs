@@ -126,9 +126,9 @@ pub fn scale_bgra(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: u
     out
 }
 
-/// Normalize `MF_MT_VIDEO_ROTATION` (counter-clockwise degrees) to one of
-/// `0`, `90`, `180` or `270`. Unknown angles are treated as no rotation so a
-/// malformed container cannot flip the picture.
+/// Normalize `MF_MT_VIDEO_ROTATION` (counter-clockwise degrees the content was
+/// rotated) to one of `0`, `90`, `180` or `270`. Unknown angles are treated as
+/// no rotation so a malformed container cannot flip the picture.
 pub fn normalize_rotation(degrees: u32) -> u32 {
     match degrees % 360 {
         90 => 90,
@@ -138,7 +138,7 @@ pub fn normalize_rotation(degrees: u32) -> u32 {
     }
 }
 
-/// Dimensions of a `w` x `h` frame after a counter-clockwise rotation.
+/// Dimensions of a `w` x `h` frame after a quarter-turn rotation.
 pub fn rotated_dimensions(w: usize, h: usize, degrees: u32) -> (usize, usize) {
     match degrees % 360 {
         90 | 270 => (h, w),
@@ -171,6 +171,15 @@ pub fn rotate_bgra_ccw(src: &[u8], w: usize, h: usize, degrees: u32) -> Vec<u8> 
         }
     }
     out
+}
+
+/// Rotate a tightly packed BGRA32 frame clockwise by `degrees`.
+///
+/// This is the display correction for `MF_MT_VIDEO_ROTATION`: the attribute
+/// records how far the content was rotated counter-clockwise, so it is undone
+/// by a clockwise rotation of the same angle.
+pub fn rotate_bgra_cw(src: &[u8], w: usize, h: usize, degrees: u32) -> Vec<u8> {
+    rotate_bgra_ccw(src, w, h, (360 - degrees % 360) % 360)
 }
 
 #[cfg(test)]
@@ -324,6 +333,19 @@ mod tests {
         assert!(rotate_bgra_ccw(&marker_frame(), 3, 2, 45).is_empty());
         assert!(rotate_bgra_ccw(&[0u8; 8], 3, 2, 90).is_empty());
         assert!(rotate_bgra_ccw(&[], 0, 2, 90).is_empty());
+    }
+
+    #[test]
+    fn rotate_bgra_cw_undoes_content_rotation() {
+        // A clockwise 90 degree display correction equals a 270 degree CCW
+        // rotation: the right column of the source becomes the bottom row.
+        let out = rotate_bgra_cw(&marker_frame(), 3, 2, 90);
+        assert_eq!(markers(&out), [4, 1, 5, 2, 6, 3]);
+        assert_eq!(
+            rotate_bgra_cw(&marker_frame(), 3, 2, 90),
+            rotate_bgra_ccw(&marker_frame(), 3, 2, 270)
+        );
+        assert!(rotate_bgra_cw(&marker_frame(), 3, 2, 45).is_empty());
     }
 
     #[test]
